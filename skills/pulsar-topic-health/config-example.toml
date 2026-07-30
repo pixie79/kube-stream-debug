@@ -1,0 +1,33 @@
+# pulsar-topic-health — example configuration (generic placeholders)
+#
+# Copy to topics.toml (or pass with -c) and replace the placeholders.
+#
+# Admin URL precedence:  --admin-url flag  >  PULSAR_ADMIN_URL env  >  this file
+# Auth token (env only):  TOKEN  first, then  PULSAR_TOKEN
+#   export TOKEN="…"        # never put the token in this file
+
+admin_url    = "https://pulsar-admin.example.internal"
+subscription = "my-consumer-subscription"
+
+# A partition whose subscription backlog exceeds this is reported as "hot".
+backlog_threshold = 100
+
+# Base topics get a per-partition breakdown automatically.
+# Explicit -partition-N entries are checked individually.
+# "persistent://" is assumed when the scheme is omitted.
+topics = [
+  "persistent://widgetco/toybox/marbles",
+  "persistent://widgetco/toybox/robots",
+  "widgetco/toybox/dominoes-partition-3",
+]
+
+# Optional colour thresholds for the BACKLOG / SIZE / UNACKED columns.
+# >= crit → red, >= warn → yellow, below warn → green; unset column = uncoloured.
+# size_* are bytes. Colours show in a terminal, stripped when piped/redirected.
+[colors]
+backlog_warn = 100000
+backlog_crit = 1000000
+size_warn    = 1073741824       # 1 GiB
+size_crit    = 5368709120       # 5 GiB
+unacked_warn = 50000
+unacked_crit = 200000

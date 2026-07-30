@@ -1,0 +1,442 @@
+//! pulsar-topic-health — topic-level health summary for a Pulsar subscription.
+//!
+//! Reads a TOML config listing the topics you care about, fetches admin stats
+//! for each, and reports: per-partition backlogs over a threshold, partitions
+//! or topics where the subscription is missing or consumer-less, and stats
+//! fetch failures.
+//!
+//! Exit codes: 0 = all healthy, 1 = usage/runtime error, 2 = unhealthy topics.
+
+mod config;
+mod cursor;
+mod drain;
+mod health;
+mod output;
+mod pulsar;
+mod snapshot;
+mod state;
+mod timestamp;
+
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use anyhow::{bail, Context};
+use clap::{Parser, ValueEnum};
+
+use crate::config::Config;
+use crate::drain::evaluate_drain;
+use crate::health::{check_topic, sample_backlog, TopicHealth};
+use crate::pulsar::{AdminClient, TopicName};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Format {
+    Table,
+    Jsonl,
+}
+
+#[derive(Debug, Parser)]
+#[command(name = "pulsar-topic-health", version, about)]
+struct Cli {
+    /// Path to the TOML config file.
+    #[arg(short, long, default_value = "topics.toml")]
+    config: PathBuf,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = Format::Table)]
+    format: Format,
+
+    /// Override the per-partition backlog threshold from the config.
+    #[arg(long)]
+    threshold: Option<i64>,
+
+    /// Override the subscription name from the config.
+    #[arg(short, long)]
+    subscription: Option<String>,
+
+    /// Pulsar admin service URL (overrides config).
+    #[arg(long, env = "PULSAR_ADMIN_URL")]
+    admin_url: Option<String>,
+
+    /// Concurrent stats requests.
+    #[arg(long, default_value_t = 8)]
+    concurrency: usize,
+
+    /// Per-request timeout in seconds.
+    #[arg(long, default_value_t = 30)]
+    timeout_secs: u64,
+
+    /// Seconds between the two backlog samples used to compute drain trend and
+    /// ETA-to-clear. Set 0 to skip the second sample and the trend columns.
+    /// Ignored in --watch mode (trend is derived from consecutive cycles).
+    #[arg(long, default_value_t = 30)]
+    drain_window_secs: u64,
+
+    /// Run continuously, redrawing every --watch-interval-secs. Trend is derived
+    /// from the previous cycle rather than a mid-cycle second sample.
+    #[arg(long)]
+    watch: bool,
+
+    /// Seconds between watch cycles (only with --watch).
+    #[arg(long, default_value_t = 60)]
+    watch_interval_secs: u64,
+
+    /// Directory to write a JSON snapshot per cycle (created if absent). Works
+    /// with or without --watch; in a single run it writes one snapshot.
+    #[arg(long)]
+    json_dir: Option<PathBuf>,
+
+    /// Maximum snapshot files to keep in --json-dir; older ones are pruned.
+    /// 0 means keep all.
+    #[arg(long, default_value_t = 100)]
+    json_dir_max_files: usize,
+
+    /// Only show unhealthy topics in the output.
+    #[arg(long)]
+    problems_only: bool,
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(exit) => exit,
+        Err(err) => {
+            eprintln!("Error: {err:#}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run() -> anyhow::Result<ExitCode> {
+    let cli = Cli::parse();
+    let config = Config::load(&cli.config)?;
+
+    let admin_url = cli
+        .admin_url
+        .clone()
+        .or(config.admin_url)
+        .context("admin URL not set: provide `admin_url` in config, --admin-url, or PULSAR_ADMIN_URL")?;
+    let subscription = cli.subscription.clone().unwrap_or(config.subscription);
+    let threshold = cli.threshold.unwrap_or(config.backlog_threshold);
+    let token = resolve_token()?;
+
+    let topics = parse_topics(&config.topics)?;
+    let client = AdminClient::new(&admin_url, &token, Duration::from_secs(cli.timeout_secs));
+
+    if cli.watch {
+        watch_loop(&cli, &config.colors, &client, &topics, &subscription, threshold)
+    } else {
+        single_run(&cli, &config.colors, &client, &topics, &subscription, threshold)
+    }
+}
+
+/// One-shot run: check, optionally take a mid-cycle drain sample, render, and
+/// optionally write a JSON snapshot. Exit code reflects health.
+fn single_run(
+    cli: &Cli,
+    colors: &config::ColorThresholds,
+    client: &AdminClient,
+    topics: &[TopicName],
+    subscription: &str,
+    threshold: i64,
+) -> anyhow::Result<ExitCode> {
+    let run_at = timestamp::now_rfc3339();
+    let mut results = check_all(client, topics, subscription, threshold, cli.concurrency);
+
+    if cli.drain_window_secs > 0 {
+        measure_drain(
+            client,
+            topics,
+            subscription,
+            &mut results,
+            cli.drain_window_secs,
+            cli.concurrency,
+        );
+    }
+
+    // Time-in-state: read prior state from the latest snapshot (if a json-dir is
+    // in use), then stamp each topic's state_since. A single run with no
+    // snapshot history has no prior, so every topic starts "now".
+    let prior = cli
+        .json_dir
+        .as_ref()
+        .and_then(|dir| snapshot::read_latest_snapshot(dir))
+        .map(|json| state::prior_from_snapshot_json(&json))
+        .unwrap_or_default();
+    state::assign_state_since(&mut results, &prior, &run_at);
+
+    if let Some(dir) = &cli.json_dir {
+        if let Err(err) = snapshot::write_snapshot(dir, &results, &run_at, cli.json_dir_max_files) {
+            eprintln!("Warning: {err}");
+        }
+    }
+
+    let display: Vec<TopicHealth> = if cli.problems_only {
+        results.into_iter().filter(|h| !h.status.is_healthy()).collect()
+    } else {
+        results
+    };
+
+    match cli.format {
+        Format::Table => {
+            println!("as of {run_at}");
+            println!("{}", output::render_table(&display, colors, &run_at));
+        }
+        Format::Jsonl => print!("{}", output::render_jsonl(&display, &run_at)?),
+    }
+
+    let unhealthy = display.iter().filter(|h| !h.status.is_healthy()).count();
+    if unhealthy > 0 {
+        eprintln!(
+            "{unhealthy} of {} topic(s) unhealthy (subscription: {subscription}, threshold: {threshold})",
+            topics.len()
+        );
+        return Ok(ExitCode::from(2));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Continuous watch: redraw every `--watch-interval-secs`, deriving drain trend
+/// from the previous cycle (no mid-cycle sleep). Runs until interrupted.
+fn watch_loop(
+    cli: &Cli,
+    colors: &config::ColorThresholds,
+    client: &AdminClient,
+    topics: &[TopicName],
+    subscription: &str,
+    threshold: i64,
+) -> anyhow::Result<ExitCode> {
+    let interval = Duration::from_secs(cli.watch_interval_secs.max(1));
+
+    // Previous cycle's per-topic backlog (keyed by topic name) and the instant
+    // it was captured, so the next cycle can compute net drain over real
+    // elapsed time.
+    let mut prev: Option<(std::collections::HashMap<String, i64>, std::time::Instant)> = None;
+
+    // Prior state for time-in-state. Seeded once from the latest snapshot (so a
+    // restarted watch inherits history), then carried forward in memory from
+    // each cycle's results.
+    let mut prior_state: std::collections::HashMap<String, state::PriorState> = cli
+        .json_dir
+        .as_ref()
+        .and_then(|dir| snapshot::read_latest_snapshot(dir))
+        .map(|json| state::prior_from_snapshot_json(&json))
+        .unwrap_or_default();
+
+    loop {
+        let cycle_start = std::time::Instant::now();
+        let run_at = timestamp::now_rfc3339();
+        let mut results = check_all(client, topics, subscription, threshold, cli.concurrency);
+
+        // Derive drain from the previous cycle rather than a fresh second sample.
+        if let Some((prev_backlogs, prev_at)) = &prev {
+            let window = cycle_start.duration_since(*prev_at).as_secs_f64();
+            apply_interval_drain(&mut results, prev_backlogs, window);
+        }
+
+        // Stamp time-in-state against the prior cycle/snapshot, then carry this
+        // cycle's states forward for the next iteration.
+        state::assign_state_since(&mut results, &prior_state, &run_at);
+        prior_state = state::prior_from_results(&results);
+
+        // Snapshot the full (unfiltered) results before any --problems-only trim.
+        if let Some(dir) = &cli.json_dir {
+            if let Err(err) =
+                snapshot::write_snapshot(dir, &results, &run_at, cli.json_dir_max_files)
+            {
+                eprintln!("Warning: {err}");
+            }
+        }
+
+        // Remember this cycle's backlogs for the next iteration's drain.
+        let backlogs: std::collections::HashMap<String, i64> = results
+            .iter()
+            .map(|h| (h.topic.clone(), h.total_backlog))
+            .collect();
+        prev = Some((backlogs, cycle_start));
+
+        let display: Vec<TopicHealth> = if cli.problems_only {
+            results
+                .iter()
+                .filter(|h| !h.status.is_healthy())
+                .cloned()
+                .collect()
+        } else {
+            results.clone()
+        };
+
+        clear_screen();
+        let unhealthy = display.iter().filter(|h| !h.status.is_healthy()).count();
+        match cli.format {
+            Format::Table => {
+                println!(
+                    "as of {run_at}   (watch: every {}s, ctrl-c to stop)",
+                    cli.watch_interval_secs
+                );
+                println!("{}", output::render_table(&display, colors, &run_at));
+                println!(
+                    "{unhealthy} of {} topic(s) unhealthy (subscription: {subscription}, threshold: {threshold})",
+                    topics.len()
+                );
+            }
+            Format::Jsonl => print!("{}", output::render_jsonl(&display, &run_at)?),
+        }
+
+        std::thread::sleep(interval);
+    }
+}
+
+/// Attach drain stats to `results` by comparing each topic's current backlog to
+/// its value in `prev_backlogs` over `window` seconds. Topics absent from the
+/// previous cycle (first appearance) get no trend.
+fn apply_interval_drain(
+    results: &mut [TopicHealth],
+    prev_backlogs: &std::collections::HashMap<String, i64>,
+    window: f64,
+) {
+    const STABLE_FRAC: f64 = 0.01;
+    if window <= 0.0 {
+        return;
+    }
+    for health in results.iter_mut() {
+        if health.error.is_some() {
+            continue;
+        }
+        if let Some(&previous) = prev_backlogs.get(&health.topic) {
+            health.drain = Some(evaluate_drain(
+                previous,
+                health.total_backlog,
+                window,
+                STABLE_FRAC,
+            ));
+        }
+    }
+}
+
+/// Clear the terminal and move the cursor home (ANSI). Cheap and portable
+/// enough for the redraw; harmless if output isn't a terminal.
+fn clear_screen() {
+    print!("\x1b[2J\x1b[H");
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+}
+
+fn resolve_token() -> anyhow::Result<String> {
+    for var in ["TOKEN", "PULSAR_TOKEN"] {
+        if let Ok(value) = std::env::var(var) {
+            if !value.trim().is_empty() {
+                return Ok(value);
+            }
+        }
+    }
+    bail!("no auth token: set TOKEN or PULSAR_TOKEN");
+}
+
+fn parse_topics(raw: &[String]) -> anyhow::Result<Vec<TopicName>> {
+    raw.iter()
+        .map(|name| TopicName::parse(name).map_err(anyhow::Error::from))
+        .collect()
+}
+
+/// Bounded worker pool over scoped threads; results are collected by input
+/// index so output order always matches the config file.
+fn check_all(
+    client: &AdminClient,
+    topics: &[TopicName],
+    subscription: &str,
+    threshold: i64,
+    concurrency: usize,
+) -> Vec<TopicHealth> {
+    parallel_map(topics, concurrency, |topic| {
+        check_topic(client, topic, subscription, threshold)
+    })
+}
+
+/// Take a second cheap backlog sample `window_secs` after the first, then
+/// attach drain trend + ETA to each topic in `results`. The first sample's
+/// backlog is the `total_backlog` already on each `TopicHealth`.
+fn measure_drain(
+    client: &AdminClient,
+    topics: &[TopicName],
+    subscription: &str,
+    results: &mut [TopicHealth],
+    window_secs: u64,
+    concurrency: usize,
+) {
+    eprintln!("Sampling backlog again in {window_secs}s to measure drain…");
+    std::thread::sleep(Duration::from_secs(window_secs));
+
+    let second: Vec<Option<i64>> = parallel_map(topics, concurrency, |topic| {
+        sample_backlog(client, topic, subscription)
+    });
+
+    // ~1% of backlog is treated as noise rather than a real trend.
+    const STABLE_FRAC: f64 = 0.01;
+    for (health, second_backlog) in results.iter_mut().zip(second) {
+        // Only meaningful where the first sample succeeded (not ERROR/MISSING).
+        if health.error.is_some() {
+            continue;
+        }
+        if let Some(second_backlog) = second_backlog {
+            health.drain = Some(evaluate_drain(
+                health.total_backlog,
+                second_backlog,
+                window_secs as f64,
+                STABLE_FRAC,
+            ));
+        }
+    }
+}
+
+/// Run `f` over `items` on a bounded scoped-thread pool, returning results in
+/// input order.
+fn parallel_map<T, R, F>(items: &[T], concurrency: usize, f: F) -> Vec<R>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> R + Sync,
+{
+    let workers = concurrency.clamp(1, 32).min(items.len().max(1));
+    let (task_tx, task_rx) = mpsc::channel::<(usize, &T)>();
+    let task_rx = Arc::new(Mutex::new(task_rx));
+    let results: Arc<Mutex<Vec<Option<R>>>> =
+        Arc::new(Mutex::new((0..items.len()).map(|_| None).collect()));
+
+    for pair in items.iter().enumerate() {
+        // Send cannot fail: receiver outlives the loop.
+        let _ = task_tx.send(pair);
+    }
+    drop(task_tx);
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let task_rx = Arc::clone(&task_rx);
+            let results = Arc::clone(&results);
+            let f = &f;
+            scope.spawn(move || loop {
+                let task = {
+                    let guard = task_rx.lock().expect("task queue lock poisoned");
+                    guard.recv()
+                };
+                let Ok((index, item)) = task else { break };
+                let out = f(item);
+                results.lock().expect("results lock poisoned")[index] = Some(out);
+            });
+        }
+    });
+
+    let collected = match Arc::try_unwrap(results) {
+        Ok(mutex) => mutex,
+        Err(_) => unreachable!("worker threads have exited, sole Arc owner remains"),
+    };
+    collected
+        .into_inner()
+        .expect("results lock poisoned")
+        .into_iter()
+        .map(|slot| match slot {
+            Some(value) => value,
+            None => unreachable!("every item produces a result"),
+        })
+        .collect()
+}

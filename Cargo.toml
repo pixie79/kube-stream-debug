@@ -1,0 +1,21 @@
+[package]
+name = "pulsar-topic-health"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "Topic-level health summary for Pulsar subscriptions: backlog thresholds, missing subscriptions, per-partition detail"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive", "env"] }
+comfy-table = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+toml = "0.8"
+ureq = { version = "2.10", features = ["json"] }
+
+[profile.release]
+lto = "thin"
+strip = true
