@@ -332,6 +332,7 @@ pub fn render_kube_section(report: &crate::kube::KubeReport) -> String {
         }
         if stats.backpressure > 0 {
             let _ = writeln!(out, "    backpressure signals: {}", stats.backpressure);
+        }
         if !stats.by_level.is_empty() {
             let levels: Vec<String> = stats
                 .by_level
