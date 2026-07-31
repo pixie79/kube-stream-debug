@@ -121,9 +121,23 @@ pub async fn gather(query: &KubeQuery) -> KubeReport {
         }
     }
 
-    // Per-pod log scan, best-effort.
+    // Per-pod log fetch, best-effort: retain raw lines (for the node-detail
+    // view), derive signals, and aggregate fleet-wide stats.
     if let Some(tail) = query.log_tail {
-        report.log_signals = gather_log_signals(&pods, &report.pods, tail).await;
+        let per_pod = gather_pod_logs(&pods, &report.pods, tail).await;
+        let mut all_lines: Vec<String> = Vec::new();
+        for pl in &per_pod {
+            for line in &pl.lines {
+                report
+                    .log_signals
+                    .extend(super::scan_log_signals(&pl.pod, line));
+                all_lines.push(line.clone());
+            }
+        }
+        if !all_lines.is_empty() {
+            report.log_stats = Some(super::aggregate_log_stats(&all_lines, 8));
+        }
+        report.pod_logs = per_pod;
     }
 
     // Live CPU/memory from the metrics API (metrics.k8s.io), best-effort — it's
@@ -242,18 +256,24 @@ fn config_toml_body(cm: &ConfigMap) -> Option<String> {
         .cloned()
 }
 
-async fn gather_log_signals(pods: &Api<Pod>, summaries: &[PodSummary], tail: i64) -> Vec<LogSignal> {
-    let mut signals = Vec::new();
+/// Fetch the last `tail` log lines for each pod, returning raw lines per pod.
+/// Signals and stats are derived from these by the caller.
+async fn gather_pod_logs(pods: &Api<Pod>, summaries: &[PodSummary], tail: i64) -> Vec<super::PodLogs> {
+    let mut out = Vec::new();
     for summary in summaries {
         let params = LogParams {
             tail_lines: Some(tail),
             ..Default::default()
         };
         if let Ok(text) = pods.logs(&summary.name, &params).await {
-            signals.extend(super::scan_log_signals(&summary.name, &text));
+            let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+            out.push(super::PodLogs {
+                pod: summary.name.clone(),
+                lines,
+            });
         }
     }
-    signals
+    out
 }
 
 /// Convert a live `Pod` into the plain summary.

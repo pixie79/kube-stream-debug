@@ -133,6 +133,36 @@ pub struct LogSignal {
     pub line: String,
 }
 
+/// Aggregate statistics computed from a pod's (or the fleet's) OTEL JSON logs.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct LogStats {
+    /// Total log lines parsed.
+    pub total: usize,
+    /// Count per level (ERROR/WARN/INFO/…), highest-severity first when rendered.
+    pub by_level: Vec<(String, usize)>,
+    /// Top normalised messages by frequency (message text → count).
+    pub top_messages: Vec<(String, usize)>,
+    /// Operational tallies extracted by pattern (e.g. "subscribe ok",
+    /// "subscribe failed", "disconnect", "ServiceNotReady").
+    pub operational: Vec<(String, usize)>,
+    /// Latest RSS reading in MB seen in a pipeline health summary, if any, plus
+    /// the earliest, so the caller can show a trend.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rss_first_mb: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rss_last_mb: Option<i64>,
+    /// Latest throughput_rps seen, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_throughput_rps: Option<i64>,
+}
+
+/// Raw recent log lines for one pod, retained for the node-detail view.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct PodLogs {
+    pub pod: String,
+    pub lines: Vec<String>,
+}
+
 /// The full Kubernetes-side picture, assembled for rendering.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct KubeReport {
@@ -144,6 +174,12 @@ pub struct KubeReport {
     pub config_assertions: Vec<ConfigAssertion>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub log_signals: Vec<LogSignal>,
+    /// Aggregate log statistics across all pods (summary view).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_stats: Option<LogStats>,
+    /// Raw recent logs per pod, for the node-detail drill-down.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pod_logs: Vec<PodLogs>,
     /// Distinct images across pods; more than one means a split rollout.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
@@ -360,6 +396,197 @@ pub fn scan_log_signals(pod: &str, log_text: &str) -> Vec<LogSignal> {
     out
 }
 
+/// Aggregate OTEL JSON log lines (across pods) into summary statistics: level
+/// counts, top messages, operational tallies, and RSS/throughput trend. Lines
+/// that aren't JSON are still counted in `total` but contribute no level.
+///
+/// Message normalisation strips the volatile bits (UUIDs, consumer ids, topic
+/// partitions, numbers) so "closed consumer 27 …partition-1" and "closed
+/// consumer 36 …partition-3" collapse into one ranked entry.
+pub fn aggregate_log_stats(lines: &[String], top_n: usize) -> LogStats {
+    use std::collections::HashMap;
+
+    let mut stats = LogStats {
+        total: lines.len(),
+        ..Default::default()
+    };
+    let mut levels: HashMap<String, usize> = HashMap::new();
+    let mut messages: HashMap<String, usize> = HashMap::new();
+    let mut ops: HashMap<&'static str, usize> = HashMap::new();
+
+    for line in lines {
+        let value: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(level) = value.get("level").and_then(|v| v.as_str()) {
+            *levels.entry(level.to_string()).or_default() += 1;
+        }
+        let message = value
+            .get("fields")
+            .and_then(|f| f.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("");
+        if !message.is_empty() {
+            *messages.entry(normalise_message(message)).or_default() += 1;
+            tally_operational(message, &mut ops);
+        }
+        // RSS + throughput from "Pipeline health summary" lines.
+        if let Some(fields) = value.get("fields") {
+            if let Some(rss) = fields.get("rss_mb").and_then(|v| v.as_i64()) {
+                stats.rss_first_mb.get_or_insert(rss);
+                stats.rss_last_mb = Some(rss);
+            }
+            if let Some(rps) = fields.get("throughput_rps").and_then(json_as_i64) {
+                stats.last_throughput_rps = Some(rps);
+            }
+        }
+    }
+
+    stats.by_level = sort_desc(levels);
+    stats.top_messages = truncate(sort_desc(messages), top_n);
+    stats.operational = sort_desc(ops.into_iter().map(|(k, v)| (k.to_string(), v)).collect());
+    stats
+}
+
+/// throughput_rps is emitted as a quoted string ("0") in these logs; accept
+/// both string and number.
+fn json_as_i64(v: &serde_json::Value) -> Option<i64> {
+    v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}
+
+fn normalise_token(token: &str) -> String {
+    // partition suffix anywhere in the token.
+    if let Some(idx) = token.find("-partition-") {
+        return format!("{}-partition-<n>", &token[..idx]);
+    }
+    let hexish = token.len() >= 6
+        && token.chars().all(|c| c.is_ascii_hexdigit() || c == '-' || c == '_')
+        && token.chars().any(|c| c.is_ascii_digit());
+    if hexish {
+        return "<id>".to_string();
+    }
+    if !token.is_empty() && token.chars().all(|c| c.is_ascii_digit()) {
+        return "<n>".to_string();
+    }
+    token.to_string()
+}
+
+/// Replace embedded volatile substrings (consumer ids, topic paths) that don't
+/// sit on whitespace boundaries, before per-token normalisation.
+fn prenormalise(msg: &str) -> String {
+    let mut s = String::with_capacity(msg.len());
+    let bytes = msg.as_bytes();
+    let mut i = 0;
+    while i < msg.len() {
+        // consumer_<alnum>
+        if msg[i..].starts_with("consumer_") {
+            s.push_str("consumer_<id>");
+            i += "consumer_".len();
+            while i < msg.len() && (bytes[i] as char).is_ascii_alphanumeric() {
+                i += 1;
+            }
+            continue;
+        }
+        // persistent:// or non-persistent:// topic path (up to a delimiter)
+        let topic_prefix = if msg[i..].starts_with("persistent://") {
+            Some("persistent://")
+        } else if msg[i..].starts_with("non-persistent://") {
+            Some("non-persistent://")
+        } else {
+            None
+        };
+        if let Some(prefix) = topic_prefix {
+            // Consume the path, but keep a trailing -partition-<n> marker if present.
+            let start = i;
+            i += prefix.len();
+            while i < msg.len() && !matches!(bytes[i] as char, ' ' | ']' | ')' | ',') {
+                i += 1;
+            }
+            let path = &msg[start..i];
+            if path.contains("-partition-") {
+                s.push_str("<topic>-partition-<n>");
+            } else {
+                s.push_str("<topic>");
+            }
+            continue;
+        }
+        let ch = msg[i..].chars().next().unwrap();
+        s.push(ch);
+        i += ch.len_utf8();
+    }
+    s
+}
+
+/// Collapse a message to a stable shape for frequency counting: replace UUIDs,
+/// hex ids, consumer names, partition suffixes, and bare numbers with markers.
+fn normalise_message(msg: &str) -> String {
+    let pre = prenormalise(msg);
+    let mut out = String::with_capacity(pre.len());
+    for token in pre.split_whitespace() {
+        let (lead, core, trail) = split_affixes(token);
+        let norm = normalise_token(core);
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(lead);
+        out.push_str(&norm);
+        out.push_str(trail);
+    }
+    if out.len() > 120 {
+        out.truncate(117);
+        out.push_str("...");
+    }
+    out
+}
+
+/// Split leading/trailing non-alphanumeric punctuation off a token, returning
+/// (leading, core, trailing). Angle-bracket markers like `<id>` are preserved.
+fn split_affixes(token: &str) -> (&str, &str, &str) {
+    if token.starts_with('<') && token.ends_with('>') {
+        return ("", token, "");
+    }
+    let is_edge = |c: char| !c.is_ascii_alphanumeric() && c != '<' && c != '>';
+    let start = token.find(|c: char| !is_edge(c)).unwrap_or(token.len());
+    let end = token
+        .rfind(|c: char| !is_edge(c))
+        .map(|i| i + token[i..].chars().next().map(char::len_utf8).unwrap_or(1))
+        .unwrap_or(start);
+    (&token[..start], &token[start..end], &token[end..])
+}
+
+/// Operational patterns worth tallying, matched case-insensitively on message.
+fn tally_operational(message: &str, ops: &mut std::collections::HashMap<&'static str, usize>) {
+    let m = message.to_lowercase();
+    let checks: &[(&str, &'static str)] = &[
+        ("success after", "subscribe ok"),
+        ("servicenotready", "subscribe failed (ServiceNotReady)"),
+        ("broker notification of closed consumer", "consumer closed by broker"),
+        ("could not close consumer", "consumer close failed"),
+        ("is not valid: disconnected", "disconnected"),
+        ("unexpectedeof", "TLS EOF"),
+        ("oomkill", "OOMKill"),
+        ("hash_salt is absent", "HASH_SALT absent"),
+    ];
+    for (needle, label) in checks {
+        if m.contains(needle) {
+            *ops.entry(label).or_default() += 1;
+        }
+    }
+}
+
+fn sort_desc(map: std::collections::HashMap<String, usize>) -> Vec<(String, usize)> {
+    let mut v: Vec<(String, usize)> = map.into_iter().collect();
+    // Highest count first; ties broken alphabetically for stable output.
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    v
+}
+
+fn truncate(mut v: Vec<(String, usize)>, n: usize) -> Vec<(String, usize)> {
+    v.truncate(n);
+    v
+}
+
 /// Correlate the consumer deployment's health to a topic, producing a short hint
 /// for the topic's DETAIL column. The reasoning: if the subscription shows
 /// NO_CONSUMERS or a growing/standing backlog, a pod-side fault is the likely
@@ -531,6 +758,52 @@ mod tests {
         assert!(kinds.contains(&"config"));
         assert!(kinds.contains(&"OOM"));
         assert!(signals.iter().all(|s| s.pod == "pod-1"));
+    }
+
+    #[test]
+    fn aggregates_otel_log_stats() {
+        // Shaped like the real OTEL JSON: level, fields.message, rss_mb, rps.
+        let lines: Vec<String> = vec![
+            r#"{"level":"ERROR","fields":{"message":"Broker notification of closed consumer 27: [27 - sub(consumer_JlObSTqT): persistent://a/b/c-partition-2]"}}"#.to_string(),
+            r#"{"level":"ERROR","fields":{"message":"Broker notification of closed consumer 36: [36 - sub(consumer_j7ka0hCw): persistent://a/b/c-partition-3]"}}"#.to_string(),
+            r#"{"level":"ERROR","fields":{"message":"TopicConsumer::subscribe(x) answered ServiceNotReady"}}"#.to_string(),
+            r#"{"level":"INFO","fields":{"message":"subscribe success after 2 retries"}}"#.to_string(),
+            r#"{"level":"INFO","fields":{"message":"Pipeline health summary","rss_mb":232,"throughput_rps":"0"}}"#.to_string(),
+            r#"{"level":"INFO","fields":{"message":"Pipeline health summary","rss_mb":1716,"throughput_rps":"0"}}"#.to_string(),
+            "not json at all".to_string(),
+        ];
+        let stats = aggregate_log_stats(&lines, 5);
+        assert_eq!(stats.total, 7);
+
+        // Level counts: 3 ERROR, 3 INFO.
+        let err = stats.by_level.iter().find(|(l, _)| l == "ERROR").map(|(_, c)| *c);
+        assert_eq!(err, Some(3));
+
+        // The two "closed consumer" messages normalise to one entry, count 2.
+        let closed = stats
+            .top_messages
+            .iter()
+            .find(|(m, _)| m.contains("closed consumer"))
+            .map(|(_, c)| *c);
+        assert_eq!(closed, Some(2), "volatile ids collapse into one message");
+
+        // Operational tallies.
+        let ops: std::collections::HashMap<_, _> = stats.operational.iter().cloned().collect();
+        assert_eq!(ops.get("consumer closed by broker"), Some(&2));
+        assert_eq!(ops.get("subscribe failed (ServiceNotReady)"), Some(&1));
+        assert_eq!(ops.get("subscribe ok"), Some(&1));
+
+        // RSS trend captured first→last.
+        assert_eq!(stats.rss_first_mb, Some(232));
+        assert_eq!(stats.rss_last_mb, Some(1716));
+        assert_eq!(stats.last_throughput_rps, Some(0));
+    }
+
+    #[test]
+    fn normalise_collapses_volatile_tokens() {
+        let a = normalise_message("closed consumer 27 topic persistent://a/b/c-partition-2");
+        let b = normalise_message("closed consumer 36 topic persistent://a/b/c-partition-9");
+        assert_eq!(a, b, "ids and partition numbers normalised away");
     }
 
     #[test]

@@ -20,16 +20,21 @@ pub enum View {
     Kube,
     /// Split: topics on top, partitions (of the selected topic) below.
     Combined,
+    /// Detail for a single node (its pods + their full logs). Reached by
+    /// pressing Enter on a node in the kube view; not part of the `v` cycle.
+    NodeDetail,
 }
 
 impl View {
-    /// Cycle order for the toggle key.
+    /// Cycle order for the toggle key. NodeDetail is excluded — it's reached by
+    /// drilling in, and cycling from it returns to the topic view.
     pub fn next(self) -> View {
         match self {
             View::Topic => View::Partition,
             View::Partition => View::Kube,
             View::Kube => View::Combined,
             View::Combined => View::Topic,
+            View::NodeDetail => View::Topic,
         }
     }
 
@@ -39,6 +44,7 @@ impl View {
             View::Partition => "partition",
             View::Kube => "kube",
             View::Combined => "combined",
+            View::NodeDetail => "node",
         }
     }
 }
@@ -55,6 +61,8 @@ pub struct ViewState {
     /// When set, the user has drilled into this topic: the combined view shows
     /// its partitions in the lower pane. Cleared by Esc.
     pub drilled_topic: Option<String>,
+    /// When set, the node-detail view is showing this node.
+    pub selected_node: Option<String>,
     /// Whether the status-legend help overlay is showing.
     pub show_help: bool,
 }
@@ -65,6 +73,7 @@ impl Default for ViewState {
             view: View::Topic,
             cursor: 0,
             drilled_topic: None,
+            selected_node: None,
             show_help: false,
         }
     }
@@ -111,10 +120,25 @@ impl ViewState {
         }
     }
 
-    /// Back out of a drill-in: clear the focus and return to the topic view.
+    /// Back out of a drill-in (topic or node): clear focus and return to the
+    /// view the user came from (topic for a topic drill, kube for a node).
     pub fn drill_out(&mut self) {
-        self.drilled_topic = None;
-        self.view = View::Topic;
+        if self.view == View::NodeDetail {
+            self.selected_node = None;
+            self.view = View::Kube;
+        } else {
+            self.drilled_topic = None;
+            self.view = View::Topic;
+        }
+    }
+
+    /// Drill into the node at the cursor within the kube view's node list.
+    pub fn drill_into_node(&mut self, nodes: &[String]) {
+        if let Some(name) = nodes.get(self.cursor) {
+            self.selected_node = Some(name.clone());
+            self.view = View::NodeDetail;
+            self.cursor = 0;
+        }
     }
 
     pub fn toggle_help(&mut self) {
@@ -150,11 +174,23 @@ pub fn status_legend() -> &'static [(&'static str, &'static str)] {
     &[
         ("OK", "consumers attached, backlog under threshold — healthy"),
         ("BACKLOG", "consumers attached but backlog over threshold"),
-        ("NO_CONSUMERS", "subscription exists but no consumers are attached"),
-        ("PARTITION_GAP", "some partitions have consumers, others don't (or no-sub)"),
-        ("MISSING_SUB", "the subscription doesn't exist on the topic at all"),
+        ("NO_CONSUMERS", "subscription EXISTS but no consumers attached (backlog is real)"),
+        ("MISSING_SUB", "subscription does NOT exist on the topic — 0 backlog means unmeasurable, not empty"),
+        ("PARTITION_GAP", "some partitions have consumers, others are missing/unconsumed"),
         ("TRIMMED", "cursor fell behind the oldest ledger — data was lost"),
         ("ERROR", "the stats fetch for this topic failed"),
+    ]
+}
+
+/// Legend for the per-partition statuses shown in the partition view.
+pub fn partition_status_legend() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("ok", "consumers attached, backlog under threshold"),
+        ("hot", "consumers attached but this partition's backlog is over threshold"),
+        ("no_consumers", "no consumer attached to this partition"),
+        ("subscription_missing", "the subscription is absent on this partition"),
+        ("at_edge", "cursor near the oldest ledger — trim risk"),
+        ("trimmed", "cursor fell behind the oldest ledger — data lost"),
     ]
 }
 
@@ -389,6 +425,24 @@ mod tests {
         assert_eq!(state.view, View::Topic);
         assert!(state.drilled_topic.is_none());
         assert_eq!(state.cursor, 1, "cursor preserved on the way out");
+    }
+
+    #[test]
+    fn node_drill_in_and_out() {
+        let nodes = vec!["node-a".to_string(), "node-b".to_string()];
+        let mut state = ViewState { view: View::Kube, cursor: 1, ..Default::default() };
+        state.drill_into_node(&nodes);
+        assert_eq!(state.view, View::NodeDetail);
+        assert_eq!(state.selected_node.as_deref(), Some("node-b"));
+        state.drill_out();
+        assert_eq!(state.view, View::Kube, "node drill-out returns to kube");
+        assert!(state.selected_node.is_none());
+    }
+
+    #[test]
+    fn partition_status_legend_covers_hot() {
+        assert!(partition_status_legend().iter().any(|(k, _)| *k == "hot"));
+        assert!(partition_status_legend().iter().any(|(k, _)| *k == "no_consumers"));
     }
 
     #[test]

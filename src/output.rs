@@ -238,10 +238,32 @@ pub fn render_kube_section(report: &crate::kube::KubeReport) -> String {
             let _ = writeln!(out, "    {} {}{}", ev.reason, ev.involved, age);
         }
     }
-    if !report.log_signals.is_empty() {
-        let _ = writeln!(out, "  log signals:");
-        for sig in report.log_signals.iter().take(15) {
-            let _ = writeln!(out, "    [{}] {}: {}", sig.kind, sig.pod, sig.line);
+    // Log statistics summary (levels, top messages, operational tallies, RSS).
+    if let Some(stats) = &report.log_stats {
+        let _ = writeln!(out, "  log summary ({} lines):", stats.total);
+        if !stats.by_level.is_empty() {
+            let levels: Vec<String> = stats
+                .by_level
+                .iter()
+                .map(|(l, c)| format!("{l} {c}"))
+                .collect();
+            let _ = writeln!(out, "    levels: {}", levels.join(", "));
+        }
+        if let (Some(first), Some(last)) = (stats.rss_first_mb, stats.rss_last_mb) {
+            let arrow = if last > first { "↑" } else if last < first { "↓" } else { "→" };
+            let _ = writeln!(out, "    rss: {first} MB {arrow} {last} MB");
+        }
+        if let Some(rps) = stats.last_throughput_rps {
+            let _ = writeln!(out, "    throughput: {rps} rps");
+        }
+        for (label, count) in &stats.operational {
+            let _ = writeln!(out, "    {label}: {count}");
+        }
+        if !stats.top_messages.is_empty() {
+            let _ = writeln!(out, "    top messages:");
+            for (msg, count) in stats.top_messages.iter().take(5) {
+                let _ = writeln!(out, "      {count}× {msg}");
+            }
         }
     }
 
