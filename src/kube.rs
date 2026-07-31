@@ -352,11 +352,10 @@ pub fn labels_discovery(
 /// chosen key has exactly one value (an unambiguous target).
 fn suggest_selector(keys: &[(String, Vec<String>)]) -> Option<String> {
     for preferred in ["app.kubernetes.io/name", "app", "k8s-app"] {
-        if let Some((k, vs)) = keys.iter().find(|(k, _)| k == preferred) {
-            if vs.len() == 1 {
+        if let Some((k, vs)) = keys.iter().find(|(k, _)| k == preferred)
+            && vs.len() == 1 {
                 return Some(format!("{k}={}", vs[0]));
             }
-        }
     }
     None
 }
@@ -467,11 +466,10 @@ fn clean_toml_value(raw: &str) -> String {
     let mut v = raw.trim();
     // Strip an inline comment (naive: a ` #` not inside quotes). Good enough for
     // scalar config values.
-    if !v.starts_with('"') {
-        if let Some(idx) = v.find(" #") {
+    if !v.starts_with('"')
+        && let Some(idx) = v.find(" #") {
             v = v[..idx].trim();
         }
-    }
     v.trim().trim_matches('"').trim().to_string()
 }
 

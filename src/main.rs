@@ -272,23 +272,21 @@ fn single_run(
     // (namespace miss) or label keys/values (selector miss) and exit. This only
     // fires here in single_run, so watch/TUI keep running and show the empty
     // panel instead (documented in the README).
-    if let Some(report) = &kube_report {
-        if let Some(discovery) = &report.discovery {
+    if let Some(report) = &kube_report
+        && let Some(discovery) = &report.discovery {
             eprintln!("kubernetes: namespace {}", report.namespace);
             eprint!("{}", crate::kube::format_discovery(discovery));
             return Ok(ExitCode::from(3));
         }
-    }
 
     if let Some(report) = &kube_report {
         annotate_with_kube(&mut results, report);
     }
 
-    if let Some(dir) = &cli.json_dir {
-        if let Err(err) = snapshot::write_snapshot(dir, &results, &run_at, cli.json_dir_max_files) {
+    if let Some(dir) = &cli.json_dir
+        && let Err(err) = snapshot::write_snapshot(dir, &results, &run_at, cli.json_dir_max_files) {
             eprintln!("Warning: {err}");
         }
-    }
 
     let display: Vec<TopicHealth> = if cli.problems_only {
         results.into_iter().filter(|h| !h.status.is_healthy()).collect()
@@ -305,11 +303,10 @@ fn single_run(
             println!("{}", output::render_table(&display, colors, &run_at));
         }
         Format::Jsonl => {
-            if let Some(report) = &kube_report {
-                if let Ok(line) = serde_json::to_string(report) {
+            if let Some(report) = &kube_report
+                && let Ok(line) = serde_json::to_string(report) {
                     println!("{line}");
                 }
-            }
             print!("{}", output::render_jsonl(&display, &run_at)?);
         }
     }
@@ -392,13 +389,12 @@ fn watch_loop(
         }
 
         // Snapshot the full (unfiltered) results before any --problems-only trim.
-        if let Some(dir) = &cli.json_dir {
-            if let Err(err) =
+        if let Some(dir) = &cli.json_dir
+            && let Err(err) =
                 snapshot::write_snapshot(dir, &results, &run_at, cli.json_dir_max_files)
             {
                 eprintln!("Warning: {err}");
             }
-        }
 
         // Remember this cycle's backlogs for the next iteration's drain.
         let backlogs: std::collections::HashMap<String, i64> = results
@@ -599,11 +595,10 @@ fn fetch_kube_report(cli: &Cli, kube_config: &config::KubeConfig) -> Option<kube
 
 fn resolve_token() -> anyhow::Result<String> {
     for var in ["TOKEN", "PULSAR_TOKEN"] {
-        if let Ok(value) = std::env::var(var) {
-            if !value.trim().is_empty() {
+        if let Ok(value) = std::env::var(var)
+            && !value.trim().is_empty() {
                 return Ok(value);
             }
-        }
     }
     bail!("no auth token: set TOKEN or PULSAR_TOKEN");
 }

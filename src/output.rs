@@ -156,7 +156,7 @@ pub fn render_kube_section(report: &crate::kube::KubeReport) -> String {
         };
         let age = pod
             .age_secs
-            .map(|s| format_short_duration(s))
+            .map(format_short_duration)
             .unwrap_or_else(|| "—".to_string());
         let state = if pod.oom_killed {
             Cell::new("OOMKilled")
@@ -210,15 +210,14 @@ pub fn render_kube_section(report: &crate::kube::KubeReport) -> String {
             report.images.join(", ")
         );
     }
-    if let Some(skew) = report.rollout_skew_secs {
-        if skew > 300 {
+    if let Some(skew) = report.rollout_skew_secs
+        && skew > 300 {
             let _ = writeln!(
                 out,
                 "  ⚠ rollout skew {} — pods not restarted together",
                 format_short_duration(skew)
             );
         }
-    }
     for assertion in report.config_assertions.iter().filter(|a| !a.pass) {
         let _ = writeln!(
             out,

@@ -67,8 +67,8 @@ fn event_loop(
         // Wait for input up to the remaining interval; refresh when it elapses.
         let elapsed = last_refresh.elapsed();
         let wait = interval.saturating_sub(elapsed);
-        if event::poll(wait)? {
-            if let Event::Key(key) = event::read()? {
+        if event::poll(wait)?
+            && let Event::Key(key) = event::read()? {
                 // Names in render order, for cursor bounds and drill resolution.
                 let pod_names: Vec<String> =
                     frame.kube.as_ref().map(|k| k.pods.iter().map(|p| p.name.clone()).collect()).unwrap_or_default();
@@ -106,7 +106,6 @@ fn event_loop(
                     _ => {}
                 }
             }
-        }
 
         if last_refresh.elapsed() >= interval {
             frame = refresh();

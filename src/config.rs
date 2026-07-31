@@ -115,16 +115,14 @@ pub enum ThresholdLevel {
 impl ColorThresholds {
     fn level(value: i64, warn: Option<i64>, crit: Option<i64>) -> ThresholdLevel {
         // Crit takes precedence; either threshold may be set independently.
-        if let Some(c) = crit {
-            if value >= c {
+        if let Some(c) = crit
+            && value >= c {
                 return ThresholdLevel::Crit;
             }
-        }
-        if let Some(w) = warn {
-            if value >= w {
+        if let Some(w) = warn
+            && value >= w {
                 return ThresholdLevel::Warn;
             }
-        }
         if warn.is_some() || crit.is_some() {
             ThresholdLevel::Ok
         } else {
