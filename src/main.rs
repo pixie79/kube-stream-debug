@@ -242,6 +242,17 @@ fn single_run(
     let run_at = timestamp::now_rfc3339();
     let mut results = check_all(client, topics, subscription, threshold, cli.concurrency);
 
+    // Kubernetes correlation (optional). Fetch this *before* the drain sample:
+    // if --kube matched no pods, we're going to exit with discovery help
+    // regardless, so there's no point waiting out the drain window first.
+    let kube_report = fetch_kube_report(cli, kube_config);
+    if let Some(report) = &kube_report
+        && let Some(discovery) = &report.discovery {
+            eprintln!("kubernetes: namespace {}", report.namespace);
+            eprint!("{}", crate::kube::format_discovery(discovery));
+            return Ok(ExitCode::from(3));
+        }
+
     if cli.drain_window_secs > 0 {
         measure_drain(
             client,
@@ -263,21 +274,6 @@ fn single_run(
         .map(|json| state::prior_from_snapshot_json(&json))
         .unwrap_or_default();
     state::assign_state_since(&mut results, &prior, &run_at);
-
-    // Kubernetes correlation (optional): fetch the consumer deployment's health
-    // and annotate unhealthy topics with a pod-side hint.
-    let kube_report = fetch_kube_report(cli, kube_config);
-
-    // One-shot help: if --kube matched no pods, print the available namespaces
-    // (namespace miss) or label keys/values (selector miss) and exit. This only
-    // fires here in single_run, so watch/TUI keep running and show the empty
-    // panel instead (documented in the README).
-    if let Some(report) = &kube_report
-        && let Some(discovery) = &report.discovery {
-            eprintln!("kubernetes: namespace {}", report.namespace);
-            eprint!("{}", crate::kube::format_discovery(discovery));
-            return Ok(ExitCode::from(3));
-        }
 
     if let Some(report) = &kube_report {
         annotate_with_kube(&mut results, report);

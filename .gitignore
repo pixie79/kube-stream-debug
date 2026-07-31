@@ -12,3 +12,4 @@
 # --json-dir snapshot output directories live at the repo root; ignore any
 # directory holding pth-*.json snapshots. Add your own dir names as needed.
 /snapshots/
+Cargo.lock
