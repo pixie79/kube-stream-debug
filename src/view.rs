@@ -55,6 +55,8 @@ pub struct ViewState {
     /// When set, the user has drilled into this topic: the combined view shows
     /// its partitions in the lower pane. Cleared by Esc.
     pub drilled_topic: Option<String>,
+    /// Whether the status-legend help overlay is showing.
+    pub show_help: bool,
 }
 
 impl Default for ViewState {
@@ -63,6 +65,7 @@ impl Default for ViewState {
             view: View::Topic,
             cursor: 0,
             drilled_topic: None,
+            show_help: false,
         }
     }
 }
@@ -113,6 +116,56 @@ impl ViewState {
         self.drilled_topic = None;
         self.view = View::Topic;
     }
+
+    pub fn toggle_help(&mut self) {
+        self.show_help = !self.show_help;
+    }
+}
+
+/// Severity of a status/partition-status, for colour mapping. Pure so both the
+/// comfy-table and ratatui render paths can share one classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    Ok,
+    Warn,
+    Bad,
+}
+
+/// Map a status label (topic or partition) to a severity.
+pub fn status_severity(label: &str) -> Severity {
+    match label {
+        "OK" | "ok" | "empty" => Severity::Ok,
+        "BACKLOG" | "backlog" | "PARTITION_GAP" | "hot" | "at_edge" | "draining" | "stable" => {
+            Severity::Warn
+        }
+        "NO_CONSUMERS" | "no_consumers" | "MISSING_SUB" | "subscription_missing" | "TRIMMED"
+        | "trimmed" | "ERROR" | "error" | "growing" => Severity::Bad,
+        _ => Severity::Warn,
+    }
+}
+
+/// The status-legend text shown in the help overlay: each topic status and what
+/// it means. Kept here (pure) so it's testable and the TUI just renders it.
+pub fn status_legend() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("OK", "consumers attached, backlog under threshold — healthy"),
+        ("BACKLOG", "consumers attached but backlog over threshold"),
+        ("NO_CONSUMERS", "subscription exists but no consumers are attached"),
+        ("PARTITION_GAP", "some partitions have consumers, others don't (or no-sub)"),
+        ("MISSING_SUB", "the subscription doesn't exist on the topic at all"),
+        ("TRIMMED", "cursor fell behind the oldest ledger — data was lost"),
+        ("ERROR", "the stats fetch for this topic failed"),
+    ]
+}
+
+/// Legend for the drain trend column.
+pub fn trend_legend() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("draining", "backlog shrinking; ETA shows time-to-clear"),
+        ("growing", "backlog rising; producers outpace consumers"),
+        ("stable", "backlog roughly flat (within ~1%)"),
+        ("empty", "no backlog"),
+    ]
 }
 
 /// A flattened partition row for the partition view.
@@ -219,6 +272,36 @@ mod tests {
     }
 
     #[test]
+    fn help_toggles() {
+        let mut state = ViewState::default();
+        assert!(!state.show_help);
+        state.toggle_help();
+        assert!(state.show_help);
+        state.toggle_help();
+        assert!(!state.show_help);
+    }
+
+    #[test]
+    fn severity_classification() {
+        assert_eq!(status_severity("OK"), Severity::Ok);
+        assert_eq!(status_severity("BACKLOG"), Severity::Warn);
+        assert_eq!(status_severity("NO_CONSUMERS"), Severity::Bad);
+        assert_eq!(status_severity("TRIMMED"), Severity::Bad);
+        assert_eq!(status_severity("growing"), Severity::Bad);
+        assert_eq!(status_severity("draining"), Severity::Warn);
+        // partition statuses
+        assert_eq!(status_severity("no_consumers"), Severity::Bad);
+        assert_eq!(status_severity("hot"), Severity::Warn);
+        assert_eq!(status_severity("ok"), Severity::Ok);
+    }
+
+    #[test]
+    fn legends_are_populated() {
+        assert!(status_legend().iter().any(|(k, _)| *k == "NO_CONSUMERS"));
+        assert!(trend_legend().iter().any(|(k, _)| *k == "growing"));
+    }
+
+    #[test]
     fn view_cycles_through_four() {
         let mut v = View::Topic;
         v = v.next();
@@ -300,6 +383,7 @@ mod tests {
             view: View::Combined,
             drilled_topic: Some("tennis".to_string()),
             cursor: 1,
+            ..Default::default()
         };
         state.drill_out();
         assert_eq!(state.view, View::Topic);

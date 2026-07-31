@@ -66,6 +66,7 @@ Navigating and drilling in:
 - **↑/↓** (or `k`/`j`) move the cursor between topics.
 - **Enter** on the selected topic drills into it — switches to the combined view with that topic's partitions in the lower pane.
 - **Esc** backs out of the drill-in to the topic view.
+- **?** toggles a legend overlay explaining every status and trend.
 - **r** refreshes now, **q** (or Ctrl-C) quits.
 
 The refresh cadence uses `--watch-interval-secs`, and drain trend is derived from consecutive refreshes just like `--watch`. The kube view has data when the binary is also built with `--features kube` and run with `--kube`.
@@ -108,7 +109,7 @@ assert    = { worker_count = "24", batch_size = "30" }
 
 CLI `--kube-assert` entries merge with the config `assert` table (the CLI wins on a duplicate key). A typoed key in `[kube]` is a hard error, like the rest of the config.
 
-It renders a pod-summary section above the topic table (pod name, ready count, restarts, age, state — with `OOMKilled`/`CrashLoopBackOff` highlighted), flags a split rollout (more than one image) or large rollout skew (pods not restarted together), lists recent OOM/eviction events, prints any failed `--kube-assert` config checks, and scans the last N log lines per pod (`--kube-log-tail`, default 200) for ramp/OOM/error/config signals. Unhealthy topics also gain a short correlation hint in their `DETAIL` (e.g. `kube: 2 pod(s) OOM-killed`). In JSONL mode the full kube report is emitted as one extra line before the topic lines.
+It renders a pod-summary section above the topic table (pod name, ready count, restarts, age, CPU and memory usage against limits, and state — with `OOMKilled`/`CrashLoopBackOff` highlighted), a node-capacity line per node the pods run on, flags a split rollout or large rollout skew, lists recent OOM/eviction events, prints any failed `--kube-assert` config checks, and scans the last N log lines per pod (`--kube-log-tail`, default 200) for ramp/OOM/error/config signals. CPU/MEM show `used/limit` coloured by percent of limit (green <70%, yellow 70–90%, red ≥90%); live usage needs metrics-server in the cluster, otherwise the used side shows `·`. Unhealthy topics also gain a short correlation hint in their `DETAIL` (e.g. `kube: 2 pod(s) OOM-killed`). In JSONL mode the full kube report is emitted as one extra line before the topic lines.
 
 The Kubernetes side is strictly best-effort and isolated: if the cluster is unreachable or auth fails, the tool prints an `unreachable` notice and still renders the full Pulsar report. A consumer-side problem (failed pods, failed config assertion, split rollout) contributes to the non-zero exit code alongside topic health, so `--kube` works as a post-deploy gate.
 

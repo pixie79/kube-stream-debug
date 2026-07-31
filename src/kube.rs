@@ -44,12 +44,61 @@ pub struct PodSummary {
     pub reason: Option<String>,
     /// True if any container's last termination was OOMKilled.
     pub oom_killed: bool,
+    /// Node this pod is scheduled on (for node-size correlation).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    /// Live CPU usage in millicores (from the metrics API); None if unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_used_milli: Option<i64>,
+    /// Live memory usage in bytes (from the metrics API); None if unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mem_used_bytes: Option<i64>,
+    /// Summed container CPU request/limit in millicores (from the pod spec).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_request_milli: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_limit_milli: Option<i64>,
+    /// Summed container memory request/limit in bytes (from the pod spec).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mem_request_bytes: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mem_limit_bytes: Option<i64>,
 }
 
 impl PodSummary {
     pub fn all_ready(&self) -> bool {
         self.total_containers > 0 && self.ready == self.total_containers
     }
+
+    /// Memory usage as a fraction of limit (0.0–1.0+), if both are known.
+    pub fn mem_fraction(&self) -> Option<f64> {
+        match (self.mem_used_bytes, self.mem_limit_bytes) {
+            (Some(used), Some(limit)) if limit > 0 => Some(used as f64 / limit as f64),
+            _ => None,
+        }
+    }
+
+    /// CPU usage as a fraction of limit (0.0–1.0+), if both are known.
+    pub fn cpu_fraction(&self) -> Option<f64> {
+        match (self.cpu_used_milli, self.cpu_limit_milli) {
+            (Some(used), Some(limit)) if limit > 0 => Some(used as f64 / limit as f64),
+            _ => None,
+        }
+    }
+}
+
+/// A node's allocatable capacity, for showing pod resource use in context.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeInfo {
+    pub name: String,
+    /// Allocatable CPU in millicores and memory in bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alloc_cpu_milli: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alloc_mem_bytes: Option<i64>,
+    /// Instance type label, if present (e.g. m5.xlarge).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance_type: Option<String>,
 }
 
 /// A Kubernetes event we care about (OOMKilling, Evicted, etc.).
@@ -98,6 +147,9 @@ pub struct KubeReport {
     /// Distinct images across pods; more than one means a split rollout.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
+    /// Node capacity for nodes the pods run on (keyed by name via the vec).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<NodeInfo>,
     /// Seconds between the oldest and newest pod creation — rollout skew.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rollout_skew_secs: Option<i64>,
@@ -150,6 +202,65 @@ impl KubeReport {
 // ─────────────────────────────────────────────────────────────────────────────
 // Pure logic (unit-tested)
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Parse a Kubernetes CPU quantity into millicores. Accepts `"250m"` (milli),
+/// `"1"` / `"2"` (whole cores), `"1500m"`, and fractional `"0.5"`. Returns None
+/// on anything unparseable.
+pub fn parse_cpu_milli(q: &str) -> Option<i64> {
+    let q = q.trim();
+    if let Some(m) = q.strip_suffix('m') {
+        return m.trim().parse::<i64>().ok();
+    }
+    // Whole or fractional cores → millicores.
+    q.parse::<f64>().ok().map(|cores| (cores * 1000.0).round() as i64)
+}
+
+/// Parse a Kubernetes memory quantity into bytes. Accepts binary suffixes
+/// (Ki, Mi, Gi, Ti, Pi), decimal suffixes (k, M, G, T, P), and a bare number.
+pub fn parse_mem_bytes(q: &str) -> Option<i64> {
+    let q = q.trim();
+    let binary = [("Ki", 1i64 << 10), ("Mi", 1 << 20), ("Gi", 1 << 30), ("Ti", 1i64 << 40), ("Pi", 1i64 << 50)];
+    for (suffix, mult) in binary {
+        if let Some(n) = q.strip_suffix(suffix) {
+            return n.trim().parse::<f64>().ok().map(|v| (v * mult as f64) as i64);
+        }
+    }
+    let decimal = [("k", 1_000i64), ("M", 1_000_000), ("G", 1_000_000_000), ("T", 1_000_000_000_000), ("P", 1_000_000_000_000_000)];
+    for (suffix, mult) in decimal {
+        if let Some(n) = q.strip_suffix(suffix) {
+            return n.trim().parse::<f64>().ok().map(|v| (v * mult as f64) as i64);
+        }
+    }
+    q.parse::<i64>().ok()
+}
+
+/// Format millicores compactly: `250m`, `1.5` (cores when ≥1000m).
+pub fn format_cpu(milli: i64) -> String {
+    if milli >= 1000 && milli % 1000 == 0 {
+        format!("{}", milli / 1000)
+    } else if milli >= 1000 {
+        format!("{:.1}", milli as f64 / 1000.0)
+    } else {
+        format!("{milli}m")
+    }
+}
+
+/// Sum a per-container resource across a pod, via a picker returning the raw
+/// quantity string. None if no container declares it.
+pub fn sum_quantity<'a>(
+    containers: impl Iterator<Item = Option<&'a str>>,
+    parse: fn(&str) -> Option<i64>,
+) -> Option<i64> {
+    let mut total = 0i64;
+    let mut any = false;
+    for q in containers.flatten() {
+        if let Some(v) = parse(q) {
+            total += v;
+            any = true;
+        }
+    }
+    any.then_some(total)
+}
 
 /// Distinct images across pods, sorted, deduplicated. >1 ⇒ split rollout.
 pub fn distinct_images(pods: &[PodSummary]) -> Vec<String> {
@@ -291,6 +402,13 @@ mod tests {
             image: Some(image.to_string()),
             reason: None,
             oom_killed: oom,
+            node: None,
+            cpu_used_milli: None,
+            mem_used_bytes: None,
+            cpu_request_milli: None,
+            cpu_limit_milli: None,
+            mem_request_bytes: None,
+            mem_limit_bytes: None,
         }
     }
 
@@ -298,6 +416,57 @@ mod tests {
     fn all_ready_reflects_container_counts() {
         assert!(pod("a", 1, 1, 0, 100, "img:1", false).all_ready());
         assert!(!pod("b", 0, 1, 3, 100, "img:1", false).all_ready());
+    }
+
+    #[test]
+    fn parses_cpu_quantities() {
+        assert_eq!(parse_cpu_milli("250m"), Some(250));
+        assert_eq!(parse_cpu_milli("1"), Some(1000));
+        assert_eq!(parse_cpu_milli("2"), Some(2000));
+        assert_eq!(parse_cpu_milli("1500m"), Some(1500));
+        assert_eq!(parse_cpu_milli("0.5"), Some(500));
+        assert_eq!(parse_cpu_milli("garbage"), None);
+    }
+
+    #[test]
+    fn parses_mem_quantities() {
+        assert_eq!(parse_mem_bytes("1Gi"), Some(1 << 30));
+        assert_eq!(parse_mem_bytes("512Mi"), Some(512 * (1 << 20)));
+        assert_eq!(parse_mem_bytes("1000000"), Some(1_000_000));
+        assert_eq!(parse_mem_bytes("1M"), Some(1_000_000));
+        assert_eq!(parse_mem_bytes("28672Mi"), Some(28672 * (1 << 20))); // ~28GiB, matches the sample
+        assert_eq!(parse_mem_bytes("nope"), None);
+    }
+
+    #[test]
+    fn formats_cpu_millicores() {
+        assert_eq!(format_cpu(250), "250m");
+        assert_eq!(format_cpu(1000), "1");
+        assert_eq!(format_cpu(1500), "1.5");
+        assert_eq!(format_cpu(2000), "2");
+    }
+
+    #[test]
+    fn sum_quantity_sums_present_values() {
+        let containers = vec![Some("250m"), None, Some("500m")];
+        assert_eq!(sum_quantity(containers.into_iter(), parse_cpu_milli), Some(750));
+        // All-None → None.
+        let empty: Vec<Option<&str>> = vec![None, None];
+        assert_eq!(sum_quantity(empty.into_iter(), parse_cpu_milli), None);
+    }
+
+    #[test]
+    fn resource_fractions() {
+        let mut p = pod("a", 1, 1, 0, 100, "i", false);
+        p.mem_used_bytes = Some(1500);
+        p.mem_limit_bytes = Some(2000);
+        assert_eq!(p.mem_fraction(), Some(0.75));
+        p.cpu_used_milli = Some(900);
+        p.cpu_limit_milli = Some(1000);
+        assert_eq!(p.cpu_fraction(), Some(0.9));
+        // Missing limit → None.
+        p.mem_limit_bytes = None;
+        assert_eq!(p.mem_fraction(), None);
     }
 
     #[test]

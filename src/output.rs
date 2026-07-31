@@ -148,6 +148,8 @@ pub fn render_kube_section(report: &crate::kube::KubeReport) -> String {
             Cell::new("READY").add_attribute(Attribute::Bold),
             Cell::new("RESTARTS").add_attribute(Attribute::Bold),
             Cell::new("AGE").add_attribute(Attribute::Bold),
+            Cell::new("CPU").add_attribute(Attribute::Bold),
+            Cell::new("MEM").add_attribute(Attribute::Bold),
             Cell::new("STATE").add_attribute(Attribute::Bold),
         ]);
 
@@ -180,10 +182,30 @@ pub fn render_kube_section(report: &crate::kube::KubeReport) -> String {
             ready_cell,
             Cell::new(pod.restarts).set_alignment(CellAlignment::Right),
             Cell::new(age).set_alignment(CellAlignment::Right),
+            resource_cell(cpu_usage_text(pod), pod.cpu_fraction()),
+            resource_cell(mem_usage_text(pod), pod.mem_fraction()),
             state,
         ]);
     }
     let _ = writeln!(out, "{table}");
+
+    // Node capacity context.
+    for node in &report.nodes {
+        let cpu = node
+            .alloc_cpu_milli
+            .map(crate::kube::format_cpu)
+            .unwrap_or_else(|| "?".to_string());
+        let mem = node
+            .alloc_mem_bytes
+            .map(format_bytes)
+            .unwrap_or_else(|| "?".to_string());
+        let inst = node
+            .instance_type
+            .as_deref()
+            .map(|i| format!(" [{i}]"))
+            .unwrap_or_default();
+        let _ = writeln!(out, "  node {}{}: {} CPU / {} allocatable", node.name, inst, cpu, mem);
+    }
 
     // Notable lines below the pod table.
     if report.images.len() > 1 {
@@ -230,6 +252,45 @@ pub fn render_kube_section(report: &crate::kube::KubeReport) -> String {
     }
 
     out
+}
+
+/// "used/limit" CPU text for a pod, using whatever's known. Examples:
+/// `120m/2` (used and limit), `120m/·` (no limit), `·/2` (no usage).
+fn cpu_usage_text(pod: &crate::kube::PodSummary) -> String {
+    let used = pod
+        .cpu_used_milli
+        .map(crate::kube::format_cpu)
+        .unwrap_or_else(|| "·".to_string());
+    let limit = pod
+        .cpu_limit_milli
+        .map(crate::kube::format_cpu)
+        .unwrap_or_else(|| "·".to_string());
+    format!("{used}/{limit}")
+}
+
+/// "used/limit" memory text for a pod.
+fn mem_usage_text(pod: &crate::kube::PodSummary) -> String {
+    let used = pod
+        .mem_used_bytes
+        .map(format_bytes)
+        .unwrap_or_else(|| "·".to_string());
+    let limit = pod
+        .mem_limit_bytes
+        .map(format_bytes)
+        .unwrap_or_else(|| "·".to_string());
+    format!("{used}/{limit}")
+}
+
+/// A resource cell coloured by usage fraction: green <70%, yellow 70–90%,
+/// red ≥90%. Uncoloured when the fraction is unknown.
+fn resource_cell(text: String, fraction: Option<f64>) -> Cell {
+    let cell = Cell::new(text).set_alignment(CellAlignment::Right);
+    match fraction {
+        Some(f) if f >= 0.90 => cell.fg(Color::Red).add_attribute(Attribute::Bold),
+        Some(f) if f >= 0.70 => cell.fg(Color::Yellow),
+        Some(_) => cell.fg(Color::Green),
+        None => cell,
+    }
 }
 
 /// Compact duration for pod ages / event ages: `45s`, `12m`, `3h`, `2d`.
@@ -495,7 +556,10 @@ mod kube_render_tests {
     fn pod(name: &str, ready: u32, total: u32, restarts: i32, age: i64, img: &str, oom: bool, reason: Option<&str>) -> PodSummary {
         PodSummary { name: name.into(), ready, total_containers: total, restarts,
             age_secs: Some(age), image: Some(img.into()),
-            reason: reason.map(|s| s.into()), oom_killed: oom }
+            reason: reason.map(|s| s.into()), oom_killed: oom,
+            node: None, cpu_used_milli: None, mem_used_bytes: None,
+            cpu_request_milli: None, cpu_limit_milli: None,
+            mem_request_bytes: None, mem_limit_bytes: None }
     }
 
     #[test]

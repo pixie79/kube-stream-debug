@@ -9,6 +9,7 @@
 //!                 in the lower pane)
 //!   Esc           back out of the drill-in to the topic view
 //!   v             cycle view (topic → partition → kube → combined)
+//!   ?             toggle the status-legend help overlay
 //!   r             refresh now
 //!   q / Ctrl-C    quit
 
@@ -16,13 +17,14 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
 use ratatui::DefaultTerminal;
 
 use crate::health::TopicHealth;
 use crate::kube::KubeReport;
 use crate::view::{
-    partition_rows, partition_rows_for_topic, PartitionRow, View, ViewState,
+    partition_rows, partition_rows_for_topic, status_legend, status_severity, trend_legend,
+    PartitionRow, Severity, View, ViewState,
 };
 
 /// Everything the TUI needs to render one frame. The caller refreshes this on
@@ -68,6 +70,7 @@ fn event_loop(
                 match key.code {
                     KeyCode::Char('q') => break,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                    KeyCode::Char('?') => state.toggle_help(),
                     KeyCode::Char('v') => state.cycle_view(),
                     KeyCode::Up | KeyCode::Char('k') => state.cursor_up(),
                     KeyCode::Down | KeyCode::Char('j') => state.cursor_down(topic_count),
@@ -123,8 +126,94 @@ fn draw(f: &mut ratatui::Frame, state: &ViewState, frame: &Frame) {
         View::Combined => draw_combined(f, chunks[1], state, frame),
     }
 
-    let help = " ↑/↓=move  Enter=drill in  Esc=back  v=view  r=refresh  q=quit";
+    let help = " ↑/↓=move  Enter=drill in  Esc=back  v=view  ?=legend  r=refresh  q=quit";
     f.render_widget(Paragraph::new(help), chunks[2]);
+
+    // Help overlay draws on top of everything else.
+    if state.show_help {
+        draw_help_overlay(f);
+    }
+}
+
+/// Map a status severity to a ratatui colour.
+fn severity_color(sev: Severity) -> Color {
+    match sev {
+        Severity::Ok => Color::Green,
+        Severity::Warn => Color::Yellow,
+        Severity::Bad => Color::Red,
+    }
+}
+
+/// A status cell coloured by its severity.
+fn status_cell(label: &str) -> Cell<'static> {
+    Cell::from(label.to_string()).style(Style::default().fg(severity_color(status_severity(label))))
+}
+
+/// Centered legend overlay explaining statuses and trends. Toggled with `?`.
+fn draw_help_overlay(f: &mut ratatui::Frame) {
+    let area = centered_rect(70, 70, f.area());
+    f.render_widget(Clear, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "Status legend",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    for (label, meaning) in status_legend() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{label:<14}"),
+                Style::default().fg(severity_color(status_severity(label))),
+            ),
+            Span::raw(*meaning),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Trend legend",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    for (label, meaning) in trend_legend() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{label:<14}"),
+                Style::default().fg(severity_color(status_severity(label))),
+            ),
+            Span::raw(*meaning),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from("CPU/MEM columns show used/limit, coloured by % of limit."));
+    lines.push(Line::from(Span::styled(
+        "press ? to close",
+        Style::default().add_modifier(Modifier::ITALIC),
+    )));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("help")
+        .style(Style::default());
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// Compute a centered rect `pct_x`×`pct_y` percent of `r`.
+fn centered_rect(pct_x: u16, pct_y: u16, r: Rect) -> Rect {
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - pct_y) / 2),
+            Constraint::Percentage(pct_y),
+            Constraint::Percentage((100 - pct_y) / 2),
+        ])
+        .split(r);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - pct_x) / 2),
+            Constraint::Percentage(pct_x),
+            Constraint::Percentage((100 - pct_x) / 2),
+        ])
+        .split(vert[1])[1]
 }
 
 fn draw_topics(f: &mut ratatui::Frame, area: Rect, state: &ViewState, frame: &Frame) {
@@ -133,7 +222,7 @@ fn draw_topics(f: &mut ratatui::Frame, area: Rect, state: &ViewState, frame: &Fr
     let rows = frame.topics.iter().enumerate().map(|(i, t)| {
         let row = Row::new(vec![
             Cell::from(short_topic(&t.topic)),
-            Cell::from(t.status.label()),
+            status_cell(t.status.label()),
             Cell::from(t.total_backlog.to_string()),
             Cell::from(crate::view::fmt_bytes(t.backlog_bytes)),
             Cell::from(t.consumers.to_string()),
@@ -172,7 +261,7 @@ fn draw_partition_rows(
         let row = Row::new(vec![
             Cell::from(short_topic(&p.topic)),
             Cell::from(format!("p{}", p.index)),
-            Cell::from(p.status),
+            status_cell(p.status),
             Cell::from(p.backlog.to_string()),
             Cell::from(crate::view::fmt_bytes(p.backlog_bytes)),
             Cell::from(p.consumers.to_string()),
