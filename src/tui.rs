@@ -296,33 +296,82 @@ fn centered_rect(pct_x: u16, pct_y: u16, r: Rect) -> Rect {
 }
 
 fn draw_topics(f: &mut ratatui::Frame, area: Rect, state: &ViewState, frame: &Frame) {
-    let header = Row::new(vec!["TOPIC", "STATUS", "BACKLOG", "SIZE", "CONS", "NET/s", "DETAIL"])
-        .style(Style::default().add_modifier(Modifier::BOLD));
+    // Show TREND/ETA only when at least one topic has a drain sample, matching
+    // the plain-table renderer (watch mode / --drain-window populate these).
+    let show_drain = frame.topics.iter().any(|t| t.drain.is_some());
+
+    let mut header_cells = vec!["TOPIC", "STATUS", "BACKLOG", "SIZE", "CONS", "NET/s"];
+    if show_drain {
+        header_cells.push("TREND");
+        header_cells.push("ETA");
+    }
+    header_cells.push("DETAIL");
+    let header = Row::new(header_cells).style(Style::default().add_modifier(Modifier::BOLD));
+
     let rows = frame.topics.iter().enumerate().map(|(i, t)| {
-        let row = Row::new(vec![
+        let mut cells = vec![
             Cell::from(short_topic(&t.topic)),
             status_cell(t.status.label()),
             Cell::from(opt_num(t.total_backlog)),
             Cell::from(opt_bytes(t.backlog_bytes)),
             Cell::from(opt_num(t.consumers)),
             Cell::from(net_str(t)),
-            Cell::from(topic_detail(t)),
-        ]);
-        emphasise(row, i == state.cursor)
+        ];
+        if show_drain {
+            cells.push(trend_cell(t));
+            cells.push(Cell::from(eta_str(t)));
+        }
+        cells.push(Cell::from(topic_detail(t)));
+        emphasise(Row::new(cells), i == state.cursor)
     });
-    let widths = [
-        Constraint::Percentage(28),
-        Constraint::Length(14),
+
+    let mut widths = vec![
+        Constraint::Percentage(24),
+        Constraint::Length(13),
         Constraint::Length(10),
         Constraint::Length(11),
         Constraint::Length(5),
         Constraint::Length(8),
-        Constraint::Percentage(30),
     ];
+    if show_drain {
+        widths.push(Constraint::Length(9)); // TREND
+        widths.push(Constraint::Length(8)); // ETA
+    }
+    widths.push(Constraint::Percentage(26)); // DETAIL
+
     let table = Table::new(rows, widths)
         .header(header)
         .block(Block::default().borders(Borders::ALL).title("topics"));
     f.render_widget(table, area);
+}
+
+/// TREND cell for a topic, coloured by direction (matches the plain table).
+fn trend_cell(t: &TopicHealth) -> Cell<'static> {
+    use crate::drain::Trend;
+    let Some(drain) = &t.drain else {
+        return Cell::from("—");
+    };
+    let color = match drain.trend {
+        Trend::Draining => Color::Green,
+        Trend::Growing => Color::Red,
+        Trend::Stable => Color::Yellow,
+        Trend::Empty => Color::DarkGray,
+    };
+    let modifier = if matches!(drain.trend, Trend::Growing) {
+        Modifier::BOLD
+    } else {
+        Modifier::empty()
+    };
+    Cell::from(drain.trend.label().to_string())
+        .style(Style::default().fg(color).add_modifier(modifier))
+}
+
+/// ETA-to-empty string for a topic, or "—" when not draining / unknown.
+fn eta_str(t: &TopicHealth) -> String {
+    match t.drain.as_ref().and_then(|d| d.eta_secs) {
+        Some(secs) => crate::drain::format_eta(secs),
+        None => "—".to_string(),
+    }
 }
 
 /// Draw a partition table from a given row set. `cursor` highlights a row when
