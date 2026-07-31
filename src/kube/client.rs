@@ -39,7 +39,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::api::{Api, ListParams, LogParams};
 use kube::Client;
 
-use super::{ConfigAssertion, KubeEvent, KubeReport, LogSignal, PodSummary};
+use super::{ConfigAssertion, KubeEvent, KubeReport, PodSummary};
 
 /// Options controlling what the client gathers.
 pub struct KubeQuery {
@@ -82,6 +82,13 @@ pub async fn gather(query: &KubeQuery) -> KubeReport {
         Err(e) => {
             return KubeReport::unreachable(&query.namespace, e.to_string());
         }
+    }
+
+    // Nothing matched: work out whether the namespace or the selector is the
+    // problem, and attach discovery help so the caller can show the choices.
+    if report.pods.is_empty() {
+        report.discovery = Some(discover_alternatives(&client, &query.namespace).await);
+        return report;
     }
 
     report.images = super::distinct_images(&report.pods);
@@ -274,6 +281,49 @@ async fn gather_pod_logs(pods: &Api<Pod>, summaries: &[PodSummary], tail: i64) -
         }
     }
     out
+}
+
+/// When a `--kube` run matches no pods, work out the more useful help: if the
+/// namespace doesn't exist, list the namespaces that do; if it does exist, list
+/// the label keys+values on its pods so the user can pick a selector.
+async fn discover_alternatives(client: &Client, namespace: &str) -> super::Discovery {
+    use k8s_openapi::api::core::v1::Namespace;
+
+    // Does the namespace exist? List namespaces (best-effort).
+    let ns_api: Api<Namespace> = Api::all(client.clone());
+    if let Ok(list) = ns_api.list(&ListParams::default()).await {
+        let names: Vec<String> = list
+            .items
+            .iter()
+            .filter_map(|n| n.metadata.name.clone())
+            .collect();
+        if !names.iter().any(|n| n == namespace) {
+            let mut sorted = names;
+            sorted.sort();
+            return super::Discovery::Namespaces(sorted);
+        }
+    }
+
+    // Namespace exists (or we couldn't list namespaces): harvest labels from all
+    // pods in it, unfiltered, so we can show what could be selected.
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let label_maps: Vec<std::collections::BTreeMap<String, String>> =
+        match pods.list(&ListParams::default()).await {
+            Ok(list) => list
+                .items
+                .iter()
+                .map(|p| {
+                    p.metadata
+                        .labels
+                        .clone()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect()
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+    super::labels_discovery(namespace, &label_maps)
 }
 
 /// Convert a live `Pod` into the plain summary.

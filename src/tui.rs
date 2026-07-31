@@ -25,7 +25,8 @@ use ratatui::DefaultTerminal;
 use crate::health::TopicHealth;
 use crate::kube::KubeReport;
 use crate::view::{
-    partition_rows, partition_rows_for_topic, status_legend, status_severity, trend_legend,
+    partition_rows, partition_rows_for_topic, partition_status_legend, status_legend,
+    status_severity, trend_legend,
     PartitionRow, Severity, View, ViewState,
 };
 
@@ -210,6 +211,20 @@ fn draw_help_overlay(f: &mut ratatui::Frame) {
         ]));
     }
     lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Partition status (partition view)",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    for (label, meaning) in partition_status_legend() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{label:<22}"),
+                Style::default().fg(severity_color(status_severity(label))),
+            ),
+            Span::raw(*meaning),
+        ]));
+    }
+    lines.push(Line::from(""));
     lines.push(Line::from("CPU/MEM columns show used/limit, coloured by % of limit."));
     lines.push(Line::from(Span::styled(
         "press ? to close",
@@ -327,6 +342,20 @@ fn draw_kube(f: &mut ratatui::Frame, area: Rect, state: &ViewState, frame: &Fram
         );
         return;
     };
+
+    // No pods matched: show the discovery help (namespaces or labels) in place,
+    // rather than a dead panel. The session keeps running.
+    if report.pods.is_empty() {
+        let text = match &report.discovery {
+            Some(d) => format!("namespace {}\n{}", report.namespace, crate::kube::format_discovery(d)),
+            None => format!("no pods matched in namespace {}", report.namespace),
+        };
+        f.render_widget(
+            Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("kubernetes — no match")),
+            area,
+        );
+        return;
+    }
 
     // Three stacked panels: pods (cursorable), nodes (cursorable), log stats.
     let panels = Layout::default()

@@ -267,6 +267,19 @@ fn single_run(
     // Kubernetes correlation (optional): fetch the consumer deployment's health
     // and annotate unhealthy topics with a pod-side hint.
     let kube_report = fetch_kube_report(cli, kube_config);
+
+    // One-shot help: if --kube matched no pods, print the available namespaces
+    // (namespace miss) or label keys/values (selector miss) and exit. This only
+    // fires here in single_run, so watch/TUI keep running and show the empty
+    // panel instead (documented in the README).
+    if let Some(report) = &kube_report {
+        if let Some(discovery) = &report.discovery {
+            eprintln!("kubernetes: namespace {}", report.namespace);
+            eprint!("{}", crate::kube::format_discovery(discovery));
+            return Ok(ExitCode::from(3));
+        }
+    }
+
     if let Some(report) = &kube_report {
         annotate_with_kube(&mut results, report);
     }

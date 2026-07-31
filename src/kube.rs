@@ -193,6 +193,29 @@ pub struct KubeReport {
     /// the report is still valid.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Populated when the namespace or selector matched nothing: what the user
+    /// could have selected instead. Drives the "here's what exists" help.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<Discovery>,
+}
+
+/// Help emitted when a `--kube` run matches no pods: either the namespace
+/// doesn't exist (list what does) or it exists but the selector missed (list
+/// the labels present on its pods).
+#[derive(Debug, Clone, Serialize)]
+pub enum Discovery {
+    /// The namespace wasn't found; these are the available namespaces.
+    Namespaces(Vec<String>),
+    /// The namespace exists but the selector matched nothing; these are the
+    /// label keys and their distinct values across pods in the namespace.
+    Labels {
+        namespace: String,
+        /// (key, sorted distinct values) pairs, sorted by key.
+        keys: Vec<(String, Vec<String>)>,
+        /// A ready-to-paste selector suggestion if an obvious app label exists.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        suggestion: Option<String>,
+    },
 }
 
 impl KubeReport {
@@ -296,6 +319,93 @@ pub fn sum_quantity<'a>(
         }
     }
     any.then_some(total)
+}
+
+/// Build the label-discovery from the label maps of pods in a namespace.
+/// Collects each key's distinct values (sorted), sorts keys, and suggests a
+/// ready-to-paste selector when a conventional app label is present.
+pub fn labels_discovery(
+    namespace: &str,
+    pod_label_maps: &[std::collections::BTreeMap<String, String>],
+) -> Discovery {
+    use std::collections::BTreeMap;
+    let mut by_key: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
+    for map in pod_label_maps {
+        for (k, v) in map {
+            by_key.entry(k.clone()).or_default().insert(v.clone());
+        }
+    }
+    let keys: Vec<(String, Vec<String>)> = by_key
+        .into_iter()
+        .map(|(k, vs)| (k, vs.into_iter().collect()))
+        .collect();
+    let suggestion = suggest_selector(&keys);
+    Discovery::Labels {
+        namespace: namespace.to_string(),
+        keys,
+        suggestion,
+    }
+}
+
+/// Suggest a selector from harvested labels, preferring the conventional
+/// `app.kubernetes.io/name`, then `app`, then `k8s-app`. Only suggests when the
+/// chosen key has exactly one value (an unambiguous target).
+fn suggest_selector(keys: &[(String, Vec<String>)]) -> Option<String> {
+    for preferred in ["app.kubernetes.io/name", "app", "k8s-app"] {
+        if let Some((k, vs)) = keys.iter().find(|(k, _)| k == preferred) {
+            if vs.len() == 1 {
+                return Some(format!("{k}={}", vs[0]));
+            }
+        }
+    }
+    None
+}
+
+/// Render a `Discovery` as plain help text for a one-shot run.
+pub fn format_discovery(d: &Discovery) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    match d {
+        Discovery::Namespaces(names) => {
+            if names.is_empty() {
+                out.push_str("  no namespaces found (or insufficient permissions)\n");
+            } else {
+                let _ = writeln!(out, "  namespace not found. Available namespaces:");
+                for n in names {
+                    let _ = writeln!(out, "    {n}");
+                }
+            }
+        }
+        Discovery::Labels {
+            namespace,
+            keys,
+            suggestion,
+        } => {
+            if keys.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "  no pods matched, and no labelled pods found in {namespace}."
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "  no pods matched the selector. Labels present on pods in {namespace}:"
+                );
+                for (k, vs) in keys {
+                    // Cap the values shown so a high-cardinality label (e.g.
+                    // pod-template-hash) doesn't flood the output.
+                    let shown: Vec<String> = vs.iter().take(6).cloned().collect();
+                    let more = vs.len().saturating_sub(shown.len());
+                    let suffix = if more > 0 { format!(" (+{more} more)") } else { String::new() };
+                    let _ = writeln!(out, "    {k} = {}{}", shown.join(", "), suffix);
+                }
+                if let Some(s) = suggestion {
+                    let _ = writeln!(out, "\n  try: --kube-selector {s}");
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Distinct images across pods, sorted, deduplicated. >1 ⇒ split rollout.
@@ -694,6 +804,68 @@ mod tests {
         // Missing limit → None.
         p.mem_limit_bytes = None;
         assert_eq!(p.mem_fraction(), None);
+    }
+
+    #[test]
+    fn labels_discovery_harvests_and_suggests() {
+        use std::collections::BTreeMap;
+        let pods = vec![
+            BTreeMap::from([
+                ("app.kubernetes.io/name".to_string(), "consumer".to_string()),
+                ("pod-template-hash".to_string(), "abc".to_string()),
+            ]),
+            BTreeMap::from([
+                ("app.kubernetes.io/name".to_string(), "consumer".to_string()),
+                ("pod-template-hash".to_string(), "def".to_string()),
+            ]),
+        ];
+        let d = labels_discovery("ns", &pods);
+        match d {
+            Discovery::Labels { namespace, keys, suggestion } => {
+                assert_eq!(namespace, "ns");
+                // app.kubernetes.io/name has one distinct value; hash has two.
+                let name_vals = keys.iter().find(|(k, _)| k == "app.kubernetes.io/name").unwrap();
+                assert_eq!(name_vals.1, vec!["consumer"]);
+                let hash_vals = keys.iter().find(|(k, _)| k == "pod-template-hash").unwrap();
+                assert_eq!(hash_vals.1.len(), 2);
+                // Suggestion picks the single-valued app label.
+                assert_eq!(suggestion.as_deref(), Some("app.kubernetes.io/name=consumer"));
+            }
+            _ => panic!("expected Labels"),
+        }
+    }
+
+    #[test]
+    fn no_suggestion_when_app_label_ambiguous() {
+        use std::collections::BTreeMap;
+        // app label has two distinct values → ambiguous → no suggestion.
+        let pods = vec![
+            BTreeMap::from([("app".to_string(), "a".to_string())]),
+            BTreeMap::from([("app".to_string(), "b".to_string())]),
+        ];
+        match labels_discovery("ns", &pods) {
+            Discovery::Labels { suggestion, .. } => assert!(suggestion.is_none()),
+            _ => panic!("expected Labels"),
+        }
+    }
+
+    #[test]
+    fn format_discovery_caps_values() {
+        use std::collections::BTreeMap;
+        // 10 distinct values for one key → capped at 6 with "+4 more".
+        let pods: Vec<BTreeMap<String, String>> = (0..10)
+            .map(|i| BTreeMap::from([("k".to_string(), format!("v{i}"))]))
+            .collect();
+        let text = format_discovery(&labels_discovery("ns", &pods));
+        assert!(text.contains("+4 more"), "high-cardinality values are capped");
+    }
+
+    #[test]
+    fn format_discovery_lists_namespaces() {
+        let d = Discovery::Namespaces(vec!["a".to_string(), "b".to_string()]);
+        let text = format_discovery(&d);
+        assert!(text.contains("Available namespaces"));
+        assert!(text.contains("  a") && text.contains("  b"));
     }
 
     #[test]
