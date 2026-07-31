@@ -310,28 +310,6 @@ pub struct PartitionRow {
     pub status: &'static str,
 }
 
-/// Flatten all topics' partitions into a single ordered row set, sorted by
-/// topic then partition index. Non-partitioned topics contribute no rows here.
-pub fn partition_rows(topics: &[TopicHealth]) -> Vec<PartitionRow> {
-    let mut rows: Vec<PartitionRow> = Vec::new();
-    for topic in topics {
-        for p in &topic.partitions {
-            rows.push(PartitionRow {
-                topic: topic.topic.clone(),
-                partition: p.partition.clone(),
-                index: p.index,
-                backlog: p.backlog,
-                backlog_bytes: p.backlog_bytes,
-                consumers: p.consumers,
-                unacked_messages: p.unacked_messages,
-                status: p.status,
-            });
-        }
-    }
-    rows.sort_by(|a, b| a.topic.cmp(&b.topic).then(a.index.cmp(&b.index)));
-    rows
-}
-
 /// Binary byte sizes (GiB/MiB/KiB), matching the table renderer. Zero → "—".
 /// Delegates to the canonical implementation so both share one format.
 pub fn fmt_bytes(bytes: i64) -> String {
@@ -440,20 +418,6 @@ mod tests {
         assert_eq!(v, View::Combined);
         v = v.next();
         assert_eq!(v, View::Topic);
-    }
-
-    #[test]
-    fn partition_rows_flattened_and_sorted() {
-        let topics = vec![
-            topic_with_partitions("b-topic", &[(1, 10, "ok"), (0, 20, "hot")]),
-            topic_with_partitions("a-topic", &[(0, 5, "ok")]),
-        ];
-        let rows = partition_rows(&topics);
-        // Sorted by topic then index: a-topic/0, b-topic/0, b-topic/1.
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].topic, "a-topic");
-        assert_eq!(rows[1].partition, "b-topic-partition-0");
-        assert_eq!(rows[2].partition, "b-topic-partition-1");
     }
 
     #[test]
