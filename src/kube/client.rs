@@ -144,6 +144,13 @@ pub async fn gather(query: &KubeQuery) -> KubeReport {
         if !all_lines.is_empty() {
             report.log_stats = Some(super::aggregate_log_stats(&all_lines, 8));
         }
+        // Flag pods whose logs show a transform/DLQ error (silent data loss).
+        let flagged = super::pods_with_transform_errors(&per_pod);
+        for pod in &mut report.pods {
+            if flagged.iter().any(|n| n == &pod.name) {
+                pod.transform_error = true;
+            }
+        }
         report.pod_logs = per_pod;
     }
 
@@ -418,7 +425,7 @@ fn pod_summary(pod: &Pod) -> PodSummary {
         age_secs,
         image,
         reason,
-        oom_killed,
+        oom_killed, transform_error: false,
         node,
         // Live usage is filled in later from the metrics API, if available.
         cpu_used_milli: None,

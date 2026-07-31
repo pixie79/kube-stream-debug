@@ -372,7 +372,9 @@ fn draw_kube(f: &mut ratatui::Frame, area: Rect, state: &ViewState, frame: &Fram
         .style(Style::default().add_modifier(Modifier::BOLD));
     let pod_rows = report.pods.iter().enumerate().map(|(i, p)| {
         let ready = format!("{}/{}", p.ready, p.total_containers);
-        let state_txt = if p.oom_killed {
+        let state_txt = if p.transform_error {
+            "DLQ-ERROR".to_string()
+        } else if p.oom_killed {
             "OOMKilled".to_string()
         } else {
             p.reason.clone().unwrap_or_else(|| "Running".to_string())
@@ -471,6 +473,12 @@ fn log_stats_lines(report: &crate::kube::KubeReport) -> Vec<Line<'static>> {
         return vec![Line::from("no logs scanned (set --kube-log-tail > 0)")];
     };
     let mut lines: Vec<Line> = Vec::new();
+    if stats.transform_errors > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("⚠ TRANSFORM/DLQ ERRORS: {} — rows dropped to DLQ (silent data loss)", stats.transform_errors),
+            Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+    }
     if !stats.by_level.is_empty() {
         let levels: Vec<String> = stats.by_level.iter().map(|(l, c)| format!("{l} {c}")).collect();
         lines.push(Line::from(format!("levels: {}", levels.join("  "))));

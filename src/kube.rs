@@ -44,6 +44,10 @@ pub struct PodSummary {
     pub reason: Option<String>,
     /// True if any container's last termination was OOMKilled.
     pub oom_killed: bool,
+    /// True if this pod's logs show a transform/DLQ error — silent data loss.
+    /// Set after log analysis; drives a distinct pod status in the table.
+    #[serde(default)]
+    pub transform_error: bool,
     /// Node this pod is scheduled on (for node-size correlation).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
@@ -154,6 +158,11 @@ pub struct LogStats {
     /// Latest throughput_rps seen, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_throughput_rps: Option<i64>,
+    /// Count of transform / data-quality / DLQ-diversion errors seen. These are
+    /// escalated above the normal operational tallies because they usually mean
+    /// silent data loss (rows diverted to a dead-letter queue while the pipeline
+    /// reports healthy). Non-zero drives a prominent alert and a pod status.
+    pub transform_errors: usize,
 }
 
 /// Raw recent log lines for one pod, retained for the node-detail view.
@@ -538,6 +547,9 @@ pub fn aggregate_log_stats(lines: &[String], top_n: usize) -> LogStats {
         if !message.is_empty() {
             *messages.entry(normalise_message(message)).or_default() += 1;
             tally_operational(message, &mut ops);
+            if is_transform_error(message) {
+                stats.transform_errors += 1;
+            }
         }
         // RSS + throughput from "Pipeline health summary" lines.
         if let Some(fields) = value.get("fields") {
@@ -664,6 +676,48 @@ fn split_affixes(token: &str) -> (&str, &str, &str) {
 }
 
 /// Operational patterns worth tallying, matched case-insensitively on message.
+/// Names of pods whose recent logs contain a transform/DLQ error, so the pod
+/// table can flag them distinctly. Pure over the raw per-pod logs.
+pub fn pods_with_transform_errors(pod_logs: &[PodLogs]) -> Vec<String> {
+    pod_logs
+        .iter()
+        .filter(|pl| {
+            pl.lines.iter().any(|line| {
+                // Parse the JSON message when possible, else scan the raw line.
+                let msg = serde_json::from_str::<serde_json::Value>(line)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("fields")
+                            .and_then(|f| f.get("message"))
+                            .and_then(|m| m.as_str())
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| line.clone());
+                is_transform_error(&msg)
+            })
+        })
+        .map(|pl| pl.pod.clone())
+        .collect()
+}
+
+/// Whether a log message indicates a transform / data-quality / DLQ-diversion
+/// error — the class that usually means silent data loss (rows sent to a
+/// dead-letter queue, or a transform failing outright) while the pipeline still
+/// reports healthy. Matched on stable substrings so the specific SQL/error text
+/// doesn't matter.
+pub fn is_transform_error(message: &str) -> bool {
+    let m = message.to_lowercase();
+    const NEEDLES: &[&str] = &[
+        "capturing dropped rows to dlq",
+        "transform/dq error",
+        "datafusion error",
+        "parsererror",
+        "sql error",
+        "dropped rows to dlq",
+    ];
+    NEEDLES.iter().any(|n| m.contains(n))
+}
+
 fn tally_operational(message: &str, ops: &mut std::collections::HashMap<&'static str, usize>) {
     let m = message.to_lowercase();
     let checks: &[(&str, &'static str)] = &[
@@ -736,7 +790,7 @@ mod tests {
             age_secs: Some(age),
             image: Some(image.to_string()),
             reason: None,
-            oom_killed: oom,
+            oom_killed: oom, transform_error: false,
             node: None,
             cpu_used_milli: None,
             mem_used_bytes: None,
@@ -802,6 +856,43 @@ mod tests {
         // Missing limit → None.
         p.mem_limit_bytes = None;
         assert_eq!(p.mem_fraction(), None);
+    }
+
+    #[test]
+    fn detects_transform_error_class() {
+        assert!(is_transform_error("Primary transform/DQ error — capturing dropped rows to DLQ"));
+        assert!(is_transform_error("DataFusion error: SQL error: ParserError(...)"));
+        assert!(is_transform_error("capturing dropped rows to DLQ"));
+        // Unrelated errors don't trigger it.
+        assert!(!is_transform_error("Consumer: connection is not valid: Disconnected"));
+        assert!(!is_transform_error("Pipeline health summary"));
+    }
+
+    #[test]
+    fn aggregator_counts_transform_errors() {
+        let lines = vec![
+            r#"{"level":"WARN","fields":{"message":"Primary transform/DQ error — capturing dropped rows to DLQ","error":"DataFusion error: SQL error: ParserError"}}"#.to_string(),
+            r#"{"level":"WARN","fields":{"message":"Primary transform/DQ error — capturing dropped rows to DLQ"}}"#.to_string(),
+            r#"{"level":"INFO","fields":{"message":"Pipeline health summary","rss_mb":100}}"#.to_string(),
+        ];
+        let stats = aggregate_log_stats(&lines, 5);
+        assert_eq!(stats.transform_errors, 2);
+    }
+
+    #[test]
+    fn per_pod_transform_error_attribution() {
+        let logs = vec![
+            PodLogs {
+                pod: "pod-good".to_string(),
+                lines: vec![r#"{"level":"INFO","fields":{"message":"all fine"}}"#.to_string()],
+            },
+            PodLogs {
+                pod: "pod-bad".to_string(),
+                lines: vec![r#"{"level":"WARN","fields":{"message":"capturing dropped rows to DLQ"}}"#.to_string()],
+            },
+        ];
+        let flagged = pods_with_transform_errors(&logs);
+        assert_eq!(flagged, vec!["pod-bad"]);
     }
 
     #[test]

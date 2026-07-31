@@ -212,7 +212,7 @@ pub fn status_severity(label: &str) -> Severity {
             Severity::Warn
         }
         "NO_CONSUMERS" | "no_consumers" | "MISSING_SUB" | "subscription_missing" | "TRIMMED"
-        | "trimmed" | "ERROR" | "error" | "growing" => Severity::Bad,
+        | "trimmed" | "ERROR" | "error" | "growing" | "DLQ-ERROR" | "OOMKilled" => Severity::Bad,
         _ => Severity::Warn,
     }
 }
@@ -373,6 +373,7 @@ mod tests {
         assert_eq!(status_severity("NO_CONSUMERS"), Severity::Bad);
         assert_eq!(status_severity("TRIMMED"), Severity::Bad);
         assert_eq!(status_severity("growing"), Severity::Bad);
+        assert_eq!(status_severity("DLQ-ERROR"), Severity::Bad);
         assert_eq!(status_severity("draining"), Severity::Warn);
         // partition statuses
         assert_eq!(status_severity("no_consumers"), Severity::Bad);

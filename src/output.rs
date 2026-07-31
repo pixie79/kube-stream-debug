@@ -158,7 +158,14 @@ pub fn render_kube_section(report: &crate::kube::KubeReport) -> String {
             .age_secs
             .map(format_short_duration)
             .unwrap_or_else(|| "—".to_string());
-        let state = if pod.oom_killed {
+        let state = if pod.transform_error {
+            // Silent data loss — the most important thing to notice, so it wins
+            // the STATE cell even over OOM.
+            Cell::new("DLQ-ERROR")
+                .fg(Color::White)
+                .bg(Color::Red)
+                .add_attribute(Attribute::Bold)
+        } else if pod.oom_killed {
             Cell::new("OOMKilled")
                 .fg(Color::White)
                 .bg(Color::Red)
@@ -182,6 +189,31 @@ pub fn render_kube_section(report: &crate::kube::KubeReport) -> String {
         ]);
     }
     let _ = writeln!(out, "{table}");
+
+    // Prominent alert: transform/DLQ errors mean rows are being silently
+    // dropped to a dead-letter queue while the pipeline looks healthy. This is
+    // easy to miss in the logs, so shout about it right under the pod table.
+    let dlq_pods: Vec<&str> = report
+        .pods
+        .iter()
+        .filter(|p| p.transform_error)
+        .map(|p| p.name.as_str())
+        .collect();
+    let dlq_count = report.log_stats.as_ref().map(|s| s.transform_errors).unwrap_or(0);
+    if !dlq_pods.is_empty() || dlq_count > 0 {
+        let banner = Cell::new(format!(
+            " ⚠ TRANSFORM/DLQ ERRORS: {} log line(s) — rows are being dropped to the DLQ (silent data loss) ",
+            dlq_count.max(dlq_pods.len())
+        ))
+        .fg(Color::White)
+        .bg(Color::Red)
+        .add_attribute(Attribute::Bold);
+        let _ = writeln!(out, "  {banner}");
+        if !dlq_pods.is_empty() {
+            let _ = writeln!(out, "    affected pods: {}", dlq_pods.join(", "));
+        }
+        let _ = writeln!(out, "    check the pod logs for the failing transform SQL / DataFusion error.");
+    }
 
     // Node capacity context.
     for node in &report.nodes {
@@ -240,6 +272,12 @@ pub fn render_kube_section(report: &crate::kube::KubeReport) -> String {
     // Log statistics summary (levels, top messages, operational tallies, RSS).
     if let Some(stats) = &report.log_stats {
         let _ = writeln!(out, "  log summary ({} lines):", stats.total);
+        if stats.transform_errors > 0 {
+            let cell = Cell::new(format!("transform/DLQ errors: {}", stats.transform_errors))
+                .fg(Color::Red)
+                .add_attribute(Attribute::Bold);
+            let _ = writeln!(out, "    {cell}");
+        }
         if !stats.by_level.is_empty() {
             let levels: Vec<String> = stats
                 .by_level
@@ -584,7 +622,7 @@ mod kube_render_tests {
     fn pod(name: &str, ready: u32, total: u32, restarts: i32, age: i64, img: &str, oom: bool, reason: Option<&str>) -> PodSummary {
         PodSummary { name: name.into(), ready, total_containers: total, restarts,
             age_secs: Some(age), image: Some(img.into()),
-            reason: reason.map(|s| s.into()), oom_killed: oom,
+            reason: reason.map(|s| s.into()), oom_killed: oom, transform_error: false,
             node: None, cpu_used_milli: None, mem_used_bytes: None,
             cpu_request_milli: None, cpu_limit_milli: None,
             mem_request_bytes: None, mem_limit_bytes: None }
