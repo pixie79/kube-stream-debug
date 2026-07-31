@@ -45,19 +45,13 @@ pub fn render_table(results: &[TopicHealth], colors: &ColorThresholds, run_at: &
             row.push(time_in_state_cell(health, run_at));
         }
         row.extend([
-            level_cell(
-                health.total_backlog.to_string(),
-                colors.backlog_level(health.total_backlog),
-            ),
-            level_cell(
-                format_bytes(health.backlog_bytes),
-                colors.size_level(health.backlog_bytes),
-            ),
-            Cell::new(health.consumers).set_alignment(CellAlignment::Right),
-            level_cell(
-                health.unacked_messages.to_string(),
-                colors.unacked_level(health.unacked_messages),
-            ),
+            opt_level_cell(health.total_backlog, |v| colors.backlog_level(v), |v| v.to_string()),
+            opt_level_cell(health.backlog_bytes, |v| colors.size_level(v), format_bytes),
+            match health.consumers {
+                Some(c) => Cell::new(c).set_alignment(CellAlignment::Right),
+                None => Cell::new("—").set_alignment(CellAlignment::Right),
+            },
+            opt_level_cell(health.unacked_messages, |v| colors.unacked_level(v), |v| v.to_string()),
             Cell::new(format!("{:.1}", health.msg_rate_out)).set_alignment(CellAlignment::Right),
             headroom_cell(health),
         ]);
@@ -306,6 +300,19 @@ fn format_short_duration(secs: i64) -> String {
     }
 }
 
+/// Like `level_cell`, but for an `Option<i64>`: `None` (unmeasurable — the
+/// subscription is absent or the fetch failed) renders as `—`, uncoloured.
+fn opt_level_cell(
+    value: Option<i64>,
+    level_of: impl Fn(i64) -> ThresholdLevel,
+    fmt: impl Fn(i64) -> String,
+) -> Cell {
+    match value {
+        Some(v) => level_cell(fmt(v), level_of(v)),
+        None => Cell::new("—").set_alignment(CellAlignment::Right),
+    }
+}
+
 /// A right-aligned cell coloured by a configured threshold level. `None` leaves
 /// it uncoloured (no thresholds set for that column).
 fn level_cell(text: String, level: ThresholdLevel) -> Cell {
@@ -497,10 +504,10 @@ mod tests {
         let health = TopicHealth {
             topic: "persistent://a/b/c".to_string(),
             status: Status::Backlog,
-            total_backlog: 5000, // over crit → should be styled
-            backlog_bytes: 0,
-            consumers: 1,
-            unacked_messages: 0,
+            total_backlog: Some(5000), // over crit → should be styled
+            backlog_bytes: Some(0),
+            consumers: Some(1),
+            unacked_messages: Some(0),
             msg_rate_out: 0.0,
             min_headroom: None,
             trimmed_partitions: Vec::new(),
@@ -528,10 +535,10 @@ mod tests {
         let health = TopicHealth {
             topic: "persistent://a/b/c".to_string(),
             status: Status::Ok,
-            total_backlog: 0,
-            backlog_bytes: 0,
-            consumers: 1,
-            unacked_messages: 0,
+            total_backlog: Some(0),
+            backlog_bytes: Some(0),
+            consumers: Some(1),
+            unacked_messages: Some(0),
             msg_rate_out: 0.0,
             min_headroom: None,
             trimmed_partitions: Vec::new(),

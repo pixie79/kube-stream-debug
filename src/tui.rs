@@ -223,9 +223,9 @@ fn draw_topics(f: &mut ratatui::Frame, area: Rect, state: &ViewState, frame: &Fr
         let row = Row::new(vec![
             Cell::from(short_topic(&t.topic)),
             status_cell(t.status.label()),
-            Cell::from(t.total_backlog.to_string()),
-            Cell::from(crate::view::fmt_bytes(t.backlog_bytes)),
-            Cell::from(t.consumers.to_string()),
+            Cell::from(opt_num(t.total_backlog)),
+            Cell::from(opt_bytes(t.backlog_bytes)),
+            Cell::from(opt_num(t.consumers)),
             Cell::from(net_str(t)),
             Cell::from(topic_detail(t)),
         ]);
@@ -334,6 +334,16 @@ fn emphasise(row: Row, on: bool) -> Row {
 
 fn short_topic(full: &str) -> String {
     full.rsplit('/').next().unwrap_or(full).to_string()
+}
+
+/// Render an optional count: the number, or `—` when unmeasurable.
+fn opt_num(v: Option<i64>) -> String {
+    v.map(|n| n.to_string()).unwrap_or_else(|| "—".to_string())
+}
+
+/// Render optional bytes: formatted size, or `—` when unmeasurable.
+fn opt_bytes(v: Option<i64>) -> String {
+    v.map(crate::view::fmt_bytes).unwrap_or_else(|| "—".to_string())
 }
 
 fn net_str(t: &TopicHealth) -> String {

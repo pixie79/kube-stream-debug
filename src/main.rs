@@ -209,7 +209,7 @@ fn run_tui(
         state::assign_state_since(&mut results, &prev_state, &run_at);
         prev_state = state::prior_from_results(&results);
         let backlogs: HashMap<String, i64> =
-            results.iter().map(|h| (h.topic.clone(), h.total_backlog)).collect();
+            results.iter().map(|h| (h.topic.clone(), h.backlog_or_zero())).collect();
         prev = Some((backlogs, now));
 
         let kube = fetch_kube_report(cli, kube_config);
@@ -390,7 +390,7 @@ fn watch_loop(
         // Remember this cycle's backlogs for the next iteration's drain.
         let backlogs: std::collections::HashMap<String, i64> = results
             .iter()
-            .map(|h| (h.topic.clone(), h.total_backlog))
+            .map(|h| (h.topic.clone(), h.backlog_or_zero()))
             .collect();
         prev = Some((backlogs, cycle_start));
 
@@ -450,7 +450,7 @@ fn apply_interval_drain(
         if let Some(&previous) = prev_backlogs.get(&health.topic) {
             health.drain = Some(evaluate_drain(
                 previous,
-                health.total_backlog,
+                health.backlog_or_zero(),
                 window,
                 STABLE_FRAC,
             ));
@@ -642,7 +642,7 @@ fn measure_drain(
         }
         if let Some(second_backlog) = second_backlog {
             health.drain = Some(evaluate_drain(
-                health.total_backlog,
+                health.backlog_or_zero(),
                 second_backlog,
                 window_secs as f64,
                 STABLE_FRAC,

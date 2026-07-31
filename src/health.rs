@@ -99,11 +99,16 @@ pub struct PartitionDetail {
 pub struct TopicHealth {
     pub topic: String,
     pub status: Status,
-    pub total_backlog: i64,
-    /// Aggregate backlog size in bytes across the subscription's partitions.
-    pub backlog_bytes: i64,
-    pub consumers: usize,
-    pub unacked_messages: i64,
+    /// Backlog in messages. `None` when unmeasurable — the subscription is
+    /// absent (MISSING_SUB) or the stats fetch failed (ERROR) — as distinct
+    /// from a real `Some(0)`.
+    pub total_backlog: Option<i64>,
+    /// Aggregate backlog size in bytes. `None` when unmeasurable (see above).
+    pub backlog_bytes: Option<i64>,
+    /// Consumer count. `None` when unmeasurable (subscription absent / error).
+    pub consumers: Option<i64>,
+    /// Unacked messages. `None` when unmeasurable (see above).
+    pub unacked_messages: Option<i64>,
     pub msg_rate_out: f64,
     /// Smallest per-partition headroom (entries before the trimmer reaches the
     /// cursor) across all partitions of this topic. `None` when unknown.
@@ -142,10 +147,11 @@ impl TopicHealth {
         TopicHealth {
             topic: topic.to_string(),
             status: Status::Error,
-            total_backlog: 0,
-            backlog_bytes: 0,
-            consumers: 0,
-            unacked_messages: 0,
+            // Unmeasurable: the fetch failed, so we know nothing about backlog.
+            total_backlog: None,
+            backlog_bytes: None,
+            consumers: None,
+            unacked_messages: None,
             msg_rate_out: 0.0,
             min_headroom: None,
             trimmed_partitions: Vec::new(),
@@ -158,6 +164,36 @@ impl TopicHealth {
             kube_hint: None,
             error: Some(error.to_string()),
         }
+    }
+
+    /// Backlog for internal math (comparisons, drain): unmeasured → 0. Use the
+    /// raw `total_backlog` Option for display/serialization.
+    pub fn backlog_or_zero(&self) -> i64 {
+        self.total_backlog.unwrap_or(0)
+    }
+
+    /// Backlog bytes for internal math; unmeasured → 0.
+    pub fn backlog_bytes_or_zero(&self) -> i64 {
+        self.backlog_bytes.unwrap_or(0)
+    }
+
+    /// Consumer count for internal math; unmeasured → 0.
+    pub fn consumers_or_zero(&self) -> i64 {
+        self.consumers.unwrap_or(0)
+    }
+
+    /// Unacked for internal math; unmeasured → 0. Part of the `_or_zero`
+    /// accessor set for symmetry; not all callers use it yet.
+    #[allow(dead_code)]
+    pub fn unacked_or_zero(&self) -> i64 {
+        self.unacked_messages.unwrap_or(0)
+    }
+
+    /// Whether the subscription's figures were actually measured (false for
+    /// MISSING_SUB and ERROR, where the numbers are unknown, not zero).
+    #[allow(dead_code)]
+    pub fn is_measured(&self) -> bool {
+        self.total_backlog.is_some()
     }
 }
 
@@ -247,10 +283,13 @@ fn evaluate(
     let mut health = TopicHealth {
         topic: topic.to_string(),
         status: Status::Ok,
-        total_backlog: 0,
-        backlog_bytes: 0,
-        consumers: 0,
-        unacked_messages: 0,
+        // Start unmeasured; the Some(sub) branch below fills these in. If the
+        // subscription is absent we return early with these as None (correct:
+        // a missing subscription has no measurable backlog).
+        total_backlog: None,
+        backlog_bytes: None,
+        consumers: None,
+        unacked_messages: None,
         msg_rate_out: stats.msg_rate_out,
         min_headroom: None,
         trimmed_partitions: Vec::new(),
@@ -260,7 +299,7 @@ fn evaluate(
         partitions: Vec::new(),
         drain: None,
         state_since: None,
-            kube_hint: None,
+        kube_hint: None,
         error: None,
     };
 
@@ -272,10 +311,10 @@ fn evaluate(
             return health;
         }
         Some(sub) => {
-            health.total_backlog = sub.msg_backlog;
-            health.backlog_bytes = sub.backlog_size;
-            health.consumers = sub.consumers.len();
-            health.unacked_messages = sub.unacked_total();
+            health.total_backlog = Some(sub.msg_backlog);
+            health.backlog_bytes = Some(sub.backlog_size);
+            health.consumers = Some(sub.consumers.len() as i64);
+            health.unacked_messages = Some(sub.unacked_total());
         }
     }
 
@@ -289,7 +328,9 @@ fn evaluate(
             .filter_map(|p| p.subscriptions.get(subscription))
             .map(|s| s.consumers.len())
             .sum();
-        health.consumers = health.consumers.max(partition_consumer_sum);
+        // Aggregated consumer count on partitioned-stats can be sparse on some
+        // broker versions; take the per-partition sum when it is larger.
+        health.consumers = Some(health.consumers_or_zero().max(partition_consumer_sum as i64));
 
         // Per-partition detail + cursor trim check: read each partition's
         // backlog from the stats we already have, judge it against its ledger
@@ -325,17 +366,18 @@ fn evaluate(
             });
         }
     } else {
-        if health.total_backlog > threshold {
+        let backlog = health.backlog_or_zero();
+        if backlog > threshold {
             // Non-partitioned topic: the topic itself is the "partition".
             health.hot_partitions.push(HotPartition {
                 partition: topic.to_string(),
-                backlog: health.total_backlog,
-                backlog_bytes: health.backlog_bytes,
+                backlog,
+                backlog_bytes: health.backlog_bytes_or_zero(),
             });
         }
         let key = topic.to_string();
         if let Some(is) = internal.get(&key) {
-            let status = evaluate_cursor(is, subscription, health.total_backlog);
+            let status = evaluate_cursor(is, subscription, backlog);
             record_cursor(&mut health, &key, &status);
         }
     }
@@ -405,7 +447,7 @@ fn classify(health: &TopicHealth) -> Status {
     if !health.trimmed_partitions.is_empty() {
         return Status::Trimmed;
     }
-    if health.consumers == 0 {
+    if health.consumers_or_zero() == 0 {
         return Status::NoConsumers;
     }
     if !health.partition_gaps.is_empty() {
@@ -632,7 +674,7 @@ mod tests {
         );
         let health = evaluate(&topic("a/b/c"), &stats, "my-sub", 100, false, &empty_internal());
         assert_eq!(health.status, Status::Ok);
-        assert_eq!(health.unacked_messages, 2);
+        assert_eq!(health.unacked_messages, Some(2));
         assert!(health.status.is_healthy());
     }
 }
