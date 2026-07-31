@@ -216,6 +216,18 @@ fn run_tui(
         if let Some(report) = &kube {
             annotate_with_kube(&mut results, report);
         }
+
+        // Persist the snapshot, same as watch mode — otherwise --json-dir is
+        // silently ignored in --tui. Written before any display filtering so the
+        // on-disk history is complete.
+        if let Some(dir) = &cli.json_dir {
+            if let Err(err) =
+                snapshot::write_snapshot(dir, &results, &run_at, cli.json_dir_max_files)
+            {
+                eprintln!("Warning: {err}");
+            }
+        }
+
         tui::Frame {
             run_at,
             topics: results,
