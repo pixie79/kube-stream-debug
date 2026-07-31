@@ -497,6 +497,8 @@ fn draw_kube(f: &mut ratatui::Frame, area: Rect, state: &ViewState, frame: &Fram
         let ready = format!("{}/{}", p.ready, p.total_containers);
         let state_txt = if p.transform_error {
             "DLQ-ERROR".to_string()
+        } else if p.memory_pressure {
+            "MEM-CRITICAL".to_string()
         } else if p.oom_killed {
             "OOMKilled".to_string()
         } else {
@@ -596,10 +598,34 @@ fn log_stats_lines(report: &crate::kube::KubeReport) -> Vec<Line<'static>> {
         return vec![Line::from("no logs scanned (set --kube-log-tail > 0)")];
     };
     let mut lines: Vec<Line> = Vec::new();
-    if stats.transform_errors > 0 {
-        lines.push(Line::from(Span::styled(
-            format!("⚠ TRANSFORM/DLQ ERRORS: {} — rows dropped to DLQ (silent data loss)", stats.transform_errors),
+    let alert = |text: String| {
+        Line::from(Span::styled(
+            text,
             Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD),
+        ))
+    };
+    if stats.transform_errors > 0 {
+        lines.push(alert(format!(
+            "⚠ TRANSFORM/DLQ ERRORS: {} — rows dropped to DLQ (silent data loss)",
+            stats.transform_errors
+        )));
+    }
+    if stats.oom_warnings > 0 {
+        lines.push(alert(format!(
+            "⚠ MEMORY PRESSURE: {} pre-OOM warning(s) — OOM kill imminent",
+            stats.oom_warnings
+        )));
+    }
+    if stats.throughput_collapsed {
+        lines.push(alert("⚠ THROUGHPUT COLLAPSE: a pod was processing, now at 0 rps".to_string()));
+    }
+    if crate::kube::is_reconnect_storm(stats.reconnects) {
+        lines.push(alert(format!("⚠ RECONNECT STORM: {} reconnects", stats.reconnects)));
+    }
+    if stats.backpressure > 0 {
+        lines.push(alert(format!(
+            "⚠ BACKPRESSURE: {} throttle/channel-full signal(s)",
+            stats.backpressure
         )));
     }
     if !stats.by_level.is_empty() {

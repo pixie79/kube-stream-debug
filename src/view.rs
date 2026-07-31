@@ -256,7 +256,7 @@ pub fn status_severity(label: &str) -> Severity {
             Severity::Warn
         }
         "NO_CONSUMERS" | "no_consumers" | "MISSING_SUB" | "subscription_missing" | "TRIMMED"
-        | "trimmed" | "ERROR" | "error" | "growing" | "DLQ-ERROR" | "OOMKilled" => Severity::Bad,
+        | "trimmed" | "ERROR" | "error" | "growing" | "DLQ-ERROR" | "OOMKilled" | "MEM-CRITICAL" => Severity::Bad,
         _ => Severity::Warn,
     }
 }

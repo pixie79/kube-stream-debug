@@ -48,6 +48,10 @@ pub struct PodSummary {
     /// Set after log analysis; drives a distinct pod status in the table.
     #[serde(default)]
     pub transform_error: bool,
+    /// True if this pod's logs show a pre-OOM memory-pressure warning — the
+    /// chance to act before the kernel OOM-kills it. Drives a red pod status.
+    #[serde(default)]
+    pub memory_pressure: bool,
     /// Node this pod is scheduled on (for node-size correlation).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
@@ -163,6 +167,22 @@ pub struct LogStats {
     /// silent data loss (rows diverted to a dead-letter queue while the pipeline
     /// reports healthy). Non-zero drives a prominent alert and a pod status.
     pub transform_errors: usize,
+    /// Count of pre-OOM memory-pressure warnings ("RSS exceeds 70%", "OOM kill
+    /// imminent"). These fire *before* the kernel OOM-kills the pod, so catching
+    /// them is the chance to act before the crash.
+    pub oom_warnings: usize,
+    /// Count of backpressure / throttle signals (an internal channel near-full,
+    /// e.g. "decoded_channel", plus a throttle/backpressure marker). Precedes a
+    /// throughput stall.
+    pub backpressure: usize,
+    /// Count of consumer reconnect events (broker-closed, disconnected, TLS
+    /// EOF). A high count over a short window is a reconnect *storm* — see
+    /// `is_reconnect_storm`.
+    pub reconnects: usize,
+    /// True when the pod had throughput and then dropped to zero — a pod that
+    /// *stopped*, distinct from one idle since start. Derived from the first and
+    /// last throughput readings in the window.
+    pub throughput_collapsed: bool,
 }
 
 /// Raw recent log lines for one pod, retained for the node-detail view.
@@ -610,6 +630,8 @@ pub fn aggregate_log_stats(lines: &[String], top_n: usize) -> LogStats {
     let mut levels: HashMap<String, usize> = HashMap::new();
     let mut messages: HashMap<String, usize> = HashMap::new();
     let mut ops: HashMap<&'static str, usize> = HashMap::new();
+    // First throughput reading in the window, to detect a collapse to zero.
+    let mut first_throughput: Option<i64> = None;
 
     for line in lines {
         let value: serde_json::Value = match serde_json::from_str(line) {
@@ -630,6 +652,15 @@ pub fn aggregate_log_stats(lines: &[String], top_n: usize) -> LogStats {
             if is_transform_error(message) {
                 stats.transform_errors += 1;
             }
+            if is_oom_warning(message) {
+                stats.oom_warnings += 1;
+            }
+            if is_backpressure(message) {
+                stats.backpressure += 1;
+            }
+            if is_reconnect(message) {
+                stats.reconnects += 1;
+            }
         }
         // RSS + throughput from "Pipeline health summary" lines.
         if let Some(fields) = value.get("fields") {
@@ -638,9 +669,17 @@ pub fn aggregate_log_stats(lines: &[String], top_n: usize) -> LogStats {
                 stats.rss_last_mb = Some(rss);
             }
             if let Some(rps) = fields.get("throughput_rps").and_then(json_as_i64) {
+                first_throughput.get_or_insert(rps);
                 stats.last_throughput_rps = Some(rps);
             }
         }
+    }
+
+    // Throughput collapse: the pod was doing work (first reading > 0) and has
+    // since dropped to zero. Distinct from a pod idle since start (first == 0),
+    // which isn't an incident.
+    if let (Some(first), Some(last)) = (first_throughput, stats.last_throughput_rps) {
+        stats.throughput_collapsed = first > 0 && last == 0;
     }
 
     stats.by_level = sort_desc(levels);
@@ -759,23 +798,29 @@ fn split_affixes(token: &str) -> (&str, &str, &str) {
 /// Names of pods whose recent logs contain a transform/DLQ error, so the pod
 /// table can flag them distinctly. Pure over the raw per-pod logs.
 pub fn pods_with_transform_errors(pod_logs: &[PodLogs]) -> Vec<String> {
+    pods_matching(pod_logs, is_transform_error)
+}
+
+/// Extract the human message from a log line (JSON `fields.message`, else the
+/// raw line), so signal predicates can run against it.
+fn line_message(line: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|v| {
+            v.get("fields")
+                .and_then(|f| f.get("message"))
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| line.to_string())
+}
+
+/// Names of pods any of whose recent log lines match `pred`. Shared by every
+/// per-pod signal (transform errors, OOM warnings, backpressure, …).
+pub fn pods_matching(pod_logs: &[PodLogs], pred: fn(&str) -> bool) -> Vec<String> {
     pod_logs
         .iter()
-        .filter(|pl| {
-            pl.lines.iter().any(|line| {
-                // Parse the JSON message when possible, else scan the raw line.
-                let msg = serde_json::from_str::<serde_json::Value>(line)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("fields")
-                            .and_then(|f| f.get("message"))
-                            .and_then(|m| m.as_str())
-                            .map(str::to_string)
-                    })
-                    .unwrap_or_else(|| line.clone());
-                is_transform_error(&msg)
-            })
-        })
+        .filter(|pl| pl.lines.iter().any(|line| pred(&line_message(line))))
         .map(|pl| pl.pod.clone())
         .collect()
 }
@@ -796,6 +841,52 @@ pub fn is_transform_error(message: &str) -> bool {
         "dropped rows to dlq",
     ];
     NEEDLES.iter().any(|n| m.contains(n))
+}
+
+/// Pre-OOM memory-pressure warning: the pipeline warns that RSS has crossed a
+/// fraction of the cgroup limit and an OOM kill is imminent. Catching this is
+/// the chance to act *before* the kernel kills the pod (after which k8s reports
+/// OOMKilled, but the data's already lost).
+pub fn is_oom_warning(message: &str) -> bool {
+    let m = message.to_lowercase();
+    const NEEDLES: &[&str] = &[
+        "oom kill imminent",
+        "rss exceeds",
+        "high memory warning",
+        "memory pressure",
+    ];
+    NEEDLES.iter().any(|n| m.contains(n))
+}
+
+/// Backpressure / throttle: an internal channel is near-full (rows backing up
+/// faster than the sink drains), which precedes a throughput stall.
+pub fn is_backpressure(message: &str) -> bool {
+    let m = message.to_lowercase();
+    // A channel-fullness marker, or an explicit throttle/backpressure log.
+    (m.contains("channel") && (m.contains("full") || m.contains("% full")))
+        || m.contains("backpressure")
+        || m.contains("throttle")
+}
+
+/// A single reconnect event (broker-closed consumer, disconnect, TLS EOF). A
+/// high count of these over one log window is a reconnect *storm* — see
+/// `is_reconnect_storm`.
+pub fn is_reconnect(message: &str) -> bool {
+    let m = message.to_lowercase();
+    const NEEDLES: &[&str] = &[
+        "broker notification of closed consumer",
+        "is not valid: disconnected",
+        "unexpectedeof",
+        "reconnecting",
+        "reconnect",
+    ];
+    NEEDLES.iter().any(|n| m.contains(n))
+}
+
+/// Whether a reconnect count constitutes a storm rather than incidental churn.
+/// Threshold chosen so a couple of reconnects don't alarm, but a burst does.
+pub fn is_reconnect_storm(reconnects: usize) -> bool {
+    reconnects >= 10
 }
 
 fn tally_operational(message: &str, ops: &mut std::collections::HashMap<&'static str, usize>) {
@@ -870,7 +961,7 @@ mod tests {
             age_secs: Some(age),
             image: Some(image.to_string()),
             reason: None,
-            oom_killed: oom, transform_error: false,
+            oom_killed: oom, transform_error: false, memory_pressure: false,
             node: None,
             cpu_used_milli: None,
             mem_used_bytes: None,
@@ -936,6 +1027,59 @@ mod tests {
         // Missing limit → None.
         p.mem_limit_bytes = None;
         assert_eq!(p.mem_fraction(), None);
+    }
+
+    #[test]
+    fn detects_oom_warning() {
+        assert!(is_oom_warning("HIGH MEMORY WARNING — RSS exceeds 70% of cgroup limit, OOM kill imminent"));
+        assert!(is_oom_warning("memory pressure detected"));
+        assert!(!is_oom_warning("Pipeline health summary"));
+    }
+
+    #[test]
+    fn detects_backpressure() {
+        assert!(is_backpressure("decoded_channel is 85% full"));
+        assert!(is_backpressure("applying backpressure to source"));
+        assert!(!is_backpressure("channel opened"));
+    }
+
+    #[test]
+    fn detects_reconnect_and_storm() {
+        assert!(is_reconnect("Broker notification of closed consumer"));
+        assert!(is_reconnect("connection is not valid: Disconnected"));
+        assert!(!is_reconnect("Pipeline health summary"));
+        assert!(!is_reconnect_storm(9));
+        assert!(is_reconnect_storm(10));
+    }
+
+    #[test]
+    fn throughput_collapse_vs_idle() {
+        // Was doing 230 rps, dropped to 0 → collapse.
+        let collapsed = vec![
+            r#"{"level":"INFO","fields":{"message":"Pipeline health summary","throughput_rps":230}}"#.to_string(),
+            r#"{"level":"INFO","fields":{"message":"Pipeline health summary","throughput_rps":0}}"#.to_string(),
+        ];
+        assert!(aggregate_log_stats(&collapsed, 5).throughput_collapsed);
+
+        // Idle since start (0 → 0) → NOT a collapse.
+        let idle = vec![
+            r#"{"level":"INFO","fields":{"message":"Pipeline health summary","throughput_rps":0}}"#.to_string(),
+            r#"{"level":"INFO","fields":{"message":"Pipeline health summary","throughput_rps":0}}"#.to_string(),
+        ];
+        assert!(!aggregate_log_stats(&idle, 5).throughput_collapsed);
+    }
+
+    #[test]
+    fn aggregator_counts_new_signals() {
+        let lines = vec![
+            r#"{"level":"WARN","fields":{"message":"HIGH MEMORY WARNING — RSS exceeds 70%, OOM kill imminent"}}"#.to_string(),
+            r#"{"level":"WARN","fields":{"message":"decoded_channel is 85% full"}}"#.to_string(),
+            r#"{"level":"WARN","fields":{"message":"Broker notification of closed consumer"}}"#.to_string(),
+        ];
+        let s = aggregate_log_stats(&lines, 5);
+        assert_eq!(s.oom_warnings, 1);
+        assert_eq!(s.backpressure, 1);
+        assert_eq!(s.reconnects, 1);
     }
 
     #[test]

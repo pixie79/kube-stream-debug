@@ -165,6 +165,13 @@ pub fn render_kube_section(report: &crate::kube::KubeReport) -> String {
                 .fg(Color::White)
                 .bg(Color::Red)
                 .add_attribute(Attribute::Bold)
+        } else if pod.memory_pressure {
+            // Pre-OOM warning: crash imminent, act now. Ranks above an actual
+            // OOMKilled (which already happened) since this one is still savable.
+            Cell::new("MEM-CRITICAL")
+                .fg(Color::White)
+                .bg(Color::Red)
+                .add_attribute(Attribute::Bold)
         } else if pod.oom_killed {
             Cell::new("OOMKilled")
                 .fg(Color::White)
@@ -210,6 +217,48 @@ pub fn render_kube_section(report: &crate::kube::KubeReport) -> String {
             let _ = writeln!(out, "    affected pods: {}", dlq_pods.join(", "));
         }
         let _ = writeln!(out, "    check the pod logs for the failing transform SQL / DataFusion error.");
+    }
+
+    // Further incident signals from the aggregated logs, each escalated the same
+    // way — these are the transitions/thresholds that precede an outage.
+    if let Some(stats) = &report.log_stats {
+        let mem_pods: Vec<&str> = report
+            .pods
+            .iter()
+            .filter(|p| p.memory_pressure)
+            .map(|p| p.name.as_str())
+            .collect();
+        if stats.oom_warnings > 0 || !mem_pods.is_empty() {
+            let _ = writeln!(
+                out,
+                "  ⚠ MEMORY PRESSURE: {} pre-OOM warning(s) — RSS near the cgroup limit, OOM kill imminent (act now)",
+                stats.oom_warnings.max(mem_pods.len())
+            );
+            if !mem_pods.is_empty() {
+                let _ = writeln!(out, "    affected pods: {}", mem_pods.join(", "));
+            }
+        }
+        if stats.throughput_collapsed {
+            let last = stats.last_throughput_rps.unwrap_or(0);
+            let _ = writeln!(
+                out,
+                "  ⚠ THROUGHPUT COLLAPSE: a pod was processing and dropped to {last} rps — it STOPPED (not idle since start)",
+            );
+        }
+        if crate::kube::is_reconnect_storm(stats.reconnects) {
+            let _ = writeln!(
+                out,
+                "  ⚠ RECONNECT STORM: {} consumer reconnect(s) — broker churn, not incidental",
+                stats.reconnects
+            );
+        }
+        if stats.backpressure > 0 {
+            let _ = writeln!(
+                out,
+                "  ⚠ BACKPRESSURE: {} throttle/channel-full signal(s) — sink can't keep up, a stall precedes this",
+                stats.backpressure
+            );
+        }
     }
 
     // Node capacity context.
@@ -272,6 +321,17 @@ pub fn render_kube_section(report: &crate::kube::KubeReport) -> String {
         if stats.transform_errors > 0 {
             let _ = writeln!(out, "    ⚠ transform/DLQ errors: {}", stats.transform_errors);
         }
+        if stats.oom_warnings > 0 {
+            let _ = writeln!(out, "    ⚠ memory-pressure warnings: {}", stats.oom_warnings);
+        }
+        if stats.throughput_collapsed {
+            let _ = writeln!(out, "    ⚠ throughput collapsed to zero");
+        }
+        if stats.reconnects > 0 {
+            let _ = writeln!(out, "    reconnects: {}", stats.reconnects);
+        }
+        if stats.backpressure > 0 {
+            let _ = writeln!(out, "    backpressure signals: {}", stats.backpressure);
         if !stats.by_level.is_empty() {
             let levels: Vec<String> = stats
                 .by_level
@@ -616,7 +676,7 @@ mod kube_render_tests {
     fn pod(name: &str, ready: u32, total: u32, restarts: i32, age: i64, img: &str, oom: bool, reason: Option<&str>) -> PodSummary {
         PodSummary { name: name.into(), ready, total_containers: total, restarts,
             age_secs: Some(age), image: Some(img.into()),
-            reason: reason.map(|s| s.into()), oom_killed: oom, transform_error: false,
+            reason: reason.map(|s| s.into()), oom_killed: oom, transform_error: false, memory_pressure: false,
             node: None, cpu_used_milli: None, mem_used_bytes: None,
             cpu_request_milli: None, cpu_limit_milli: None,
             mem_request_bytes: None, mem_limit_bytes: None }
