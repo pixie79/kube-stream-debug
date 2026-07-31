@@ -47,33 +47,26 @@ impl View {
     }
 }
 
-/// How a filter/selection affects visible rows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SelectMode {
-    /// Show every row; the matching one is emphasised.
-    Highlight,
-    /// Show only matching rows; hide the rest.
-    Filter,
-}
 
-/// Mutable UI state driven by keypresses.
+/// Mutable UI state driven by keypresses. Navigation is a cursor (↑/↓) plus a
+/// drill-in focus (Enter on a topic scopes the combined view to it; Esc backs
+/// out). There is no text filter.
 #[derive(Debug, Clone)]
 pub struct ViewState {
     pub view: View,
-    /// Free-text filter/select query (matches topic or partition name).
-    pub query: String,
-    pub mode: SelectMode,
-    /// Whether the query box is currently accepting input.
-    pub editing_query: bool,
+    /// Index of the highlighted row in the current view's row set.
+    pub cursor: usize,
+    /// When set, the user has drilled into this topic: the combined view shows
+    /// its partitions in the lower pane. Cleared by Esc.
+    pub drilled_topic: Option<String>,
 }
 
 impl Default for ViewState {
     fn default() -> Self {
         ViewState {
             view: View::Topic,
-            query: String::new(),
-            mode: SelectMode::Highlight,
-            editing_query: false,
+            cursor: 0,
+            drilled_topic: None,
         }
     }
 }
@@ -81,17 +74,48 @@ impl Default for ViewState {
 impl ViewState {
     pub fn cycle_view(&mut self) {
         self.view = self.view.next();
+        self.cursor = 0;
     }
 
-    pub fn toggle_mode(&mut self) {
-        self.mode = match self.mode {
-            SelectMode::Highlight => SelectMode::Filter,
-            SelectMode::Filter => SelectMode::Highlight,
-        };
+    /// Move the cursor down, clamped to `len-1`. No-op on an empty set.
+    pub fn cursor_down(&mut self, len: usize) {
+        if len == 0 {
+            return;
+        }
+        if self.cursor + 1 < len {
+            self.cursor += 1;
+        }
     }
 
-    pub fn clear_query(&mut self) {
-        self.query.clear();
+    /// Move the cursor up, clamped to 0.
+    pub fn cursor_up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    /// Clamp the cursor into range after the row set changes (e.g. a refresh
+    /// removed rows). Keeps the cursor on the last row rather than out of bounds.
+    pub fn clamp_cursor(&mut self, len: usize) {
+        if len == 0 {
+            self.cursor = 0;
+        } else if self.cursor >= len {
+            self.cursor = len - 1;
+        }
+    }
+
+    /// Drill into the topic at the cursor: switch to the combined view scoped to
+    /// that topic. `topics` is the currently-visible topic ordering so the
+    /// cursor index resolves to the right name.
+    pub fn drill_in(&mut self, topics: &[TopicHealth]) {
+        if let Some(t) = topics.get(self.cursor) {
+            self.drilled_topic = Some(t.topic.clone());
+            self.view = View::Combined;
+        }
+    }
+
+    /// Back out of a drill-in: clear the focus and return to the topic view.
+    pub fn drill_out(&mut self) {
+        self.drilled_topic = None;
+        self.view = View::Topic;
     }
 }
 
@@ -130,70 +154,33 @@ pub fn partition_rows(topics: &[TopicHealth]) -> Vec<PartitionRow> {
     rows
 }
 
-/// Does a name match the query? Case-insensitive substring; empty query matches
-/// everything. Matches against the full partition name and its short `pN` form,
-/// so `p3` matches `…-partition-3`.
-pub fn matches(query: &str, name: &str) -> bool {
-    if query.is_empty() {
-        return true;
-    }
-    let q = query.to_lowercase();
-    let n = name.to_lowercase();
-    if n.contains(&q) {
-        return true;
-    }
-    // Allow `pN` to match `-partition-N`.
-    if let Some(idx) = short_partition_index(name) {
-        if q == format!("p{idx}") || q == idx.to_string() {
-            return true;
-        }
-    }
-    false
-}
-
-fn short_partition_index(name: &str) -> Option<u32> {
-    name.rsplit_once("-partition-")
-        .and_then(|(_, n)| n.parse().ok())
-}
-
 /// Binary byte sizes (GiB/MiB/KiB), matching the table renderer. Zero → "—".
 /// Delegates to the canonical implementation so both share one format.
 pub fn fmt_bytes(bytes: i64) -> String {
     crate::output::format_bytes(bytes)
 }
 
-/// Apply the current mode to a set of topics: in Filter mode, keep only those
-/// matching the query; in Highlight mode, keep all. Returns indices into the
-/// input so the caller can mark which rows are highlighted.
-pub fn visible_topic_indices(state: &ViewState, topics: &[TopicHealth]) -> Vec<usize> {
-    topics
+/// Partition rows for a single named topic (the drilled-into topic), sorted by
+/// partition index. Empty if the topic isn't found or has no partitions.
+pub fn partition_rows_for_topic(topics: &[TopicHealth], topic: &str) -> Vec<PartitionRow> {
+    let mut rows: Vec<PartitionRow> = topics
         .iter()
-        .enumerate()
-        .filter(|(_, t)| match state.mode {
-            SelectMode::Filter => matches(&state.query, &t.topic),
-            SelectMode::Highlight => true,
+        .filter(|t| t.topic == topic)
+        .flat_map(|t| {
+            t.partitions.iter().map(move |p| PartitionRow {
+                topic: t.topic.clone(),
+                partition: p.partition.clone(),
+                index: p.index,
+                backlog: p.backlog,
+                backlog_bytes: p.backlog_bytes,
+                consumers: p.consumers,
+                unacked_messages: p.unacked_messages,
+                status: p.status,
+            })
         })
-        .map(|(i, _)| i)
-        .collect()
-}
-
-/// Same for flattened partition rows: filter matches against either the parent
-/// topic name or the partition name.
-pub fn visible_partition_indices(state: &ViewState, rows: &[PartitionRow]) -> Vec<usize> {
-    rows.iter()
-        .enumerate()
-        .filter(|(_, r)| match state.mode {
-            SelectMode::Filter => matches(&state.query, &r.partition) || matches(&state.query, &r.topic),
-            SelectMode::Highlight => true,
-        })
-        .map(|(i, _)| i)
-        .collect()
-}
-
-/// Whether a given name should be emphasised (Highlight mode with a non-empty
-/// query that matches).
-pub fn is_highlighted(state: &ViewState, name: &str) -> bool {
-    state.mode == SelectMode::Highlight && !state.query.is_empty() && matches(&state.query, name)
+        .collect();
+    rows.sort_by_key(|r| r.index);
+    rows
 }
 
 #[cfg(test)]
@@ -263,68 +250,85 @@ mod tests {
     }
 
     #[test]
-    fn matches_handles_short_partition_form() {
-        assert!(matches("p3", "foo-partition-3"));
-        assert!(matches("3", "foo-partition-3"));
-        assert!(matches("foo", "foo-partition-3"));
-        assert!(!matches("p4", "foo-partition-3"));
-        assert!(matches("", "anything"), "empty query matches all");
+    fn cursor_moves_and_clamps() {
+        let mut state = ViewState::default();
+        assert_eq!(state.cursor, 0);
+        state.cursor_up(); // already at top, stays
+        assert_eq!(state.cursor, 0);
+        state.cursor_down(3);
+        state.cursor_down(3);
+        assert_eq!(state.cursor, 2);
+        state.cursor_down(3); // at last row, clamps
+        assert_eq!(state.cursor, 2);
+        state.cursor_up();
+        assert_eq!(state.cursor, 1);
     }
 
     #[test]
-    fn filter_mode_hides_nonmatching() {
+    fn cursor_down_noop_on_empty() {
+        let mut state = ViewState::default();
+        state.cursor_down(0);
+        assert_eq!(state.cursor, 0);
+    }
+
+    #[test]
+    fn clamp_after_rowset_shrinks() {
+        let mut state = ViewState { cursor: 5, ..Default::default() };
+        state.clamp_cursor(3);
+        assert_eq!(state.cursor, 2, "clamped to last row");
+        state.clamp_cursor(0);
+        assert_eq!(state.cursor, 0, "empty set resets to 0");
+    }
+
+    #[test]
+    fn drill_in_scopes_to_selected_topic_and_switches_view() {
         let topics = vec![
             topic_with_partitions("soccer", &[(0, 5, "ok")]),
+            topic_with_partitions("tennis", &[(0, 5, "ok"), (1, 9, "hot")]),
+        ];
+        let mut state = ViewState::default();
+        state.cursor_down(topics.len()); // cursor now on "tennis"
+        state.drill_in(&topics);
+        assert_eq!(state.drilled_topic.as_deref(), Some("tennis"));
+        assert_eq!(state.view, View::Combined);
+
+        // The lower pane shows only tennis's partitions.
+        let rows = partition_rows_for_topic(&topics, state.drilled_topic.as_deref().unwrap());
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.topic == "tennis"));
+    }
+
+    #[test]
+    fn drill_out_returns_to_topic_view() {
+        let mut state = ViewState {
+            view: View::Combined,
+            drilled_topic: Some("tennis".to_string()),
+            cursor: 1,
+        };
+        state.drill_out();
+        assert_eq!(state.view, View::Topic);
+        assert!(state.drilled_topic.is_none());
+        assert_eq!(state.cursor, 1, "cursor preserved on the way out");
+    }
+
+    #[test]
+    fn cycle_view_resets_cursor() {
+        let mut state = ViewState { cursor: 4, ..Default::default() };
+        state.cycle_view();
+        assert_eq!(state.view, View::Partition);
+        assert_eq!(state.cursor, 0);
+    }
+
+    #[test]
+    fn partition_rows_for_topic_only_that_topic() {
+        let topics = vec![
+            topic_with_partitions("soccer", &[(0, 5, "ok"), (1, 7, "ok")]),
             topic_with_partitions("tennis", &[(0, 5, "ok")]),
         ];
-        let mut state = ViewState {
-            mode: SelectMode::Filter,
-            query: "soccer".to_string(),
-            ..Default::default()
-        };
-        let visible = visible_topic_indices(&state, &topics);
-        assert_eq!(visible, vec![0]);
-
-        // Highlight mode keeps all.
-        state.mode = SelectMode::Highlight;
-        assert_eq!(visible_topic_indices(&state, &topics).len(), 2);
-    }
-
-    #[test]
-    fn highlight_flags_only_in_highlight_mode() {
-        let mut state = ViewState {
-            mode: SelectMode::Highlight,
-            query: "tennis".to_string(),
-            ..Default::default()
-        };
-        assert!(is_highlighted(&state, "tennis"));
-        assert!(!is_highlighted(&state, "soccer"));
-        // In filter mode nothing is "highlighted" (rows are hidden instead).
-        state.mode = SelectMode::Filter;
-        assert!(!is_highlighted(&state, "tennis"));
-    }
-
-    #[test]
-    fn partition_filter_matches_topic_or_partition() {
-        let topics = vec![topic_with_partitions("soccer", &[(0, 5, "ok"), (3, 99, "hot")])];
-        let rows = partition_rows(&topics);
-        let state = ViewState {
-            mode: SelectMode::Filter,
-            query: "p3".to_string(),
-            ..Default::default()
-        };
-        let visible = visible_partition_indices(&state, &rows);
-        assert_eq!(visible.len(), 1);
-        assert_eq!(rows[visible[0]].index, 3);
-    }
-
-    #[test]
-    fn toggle_mode_flips() {
-        let mut state = ViewState::default();
-        assert_eq!(state.mode, SelectMode::Highlight);
-        state.toggle_mode();
-        assert_eq!(state.mode, SelectMode::Filter);
-        state.toggle_mode();
-        assert_eq!(state.mode, SelectMode::Highlight);
+        let rows = partition_rows_for_topic(&topics, "soccer");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.topic == "soccer"));
+        // Unknown topic → empty.
+        assert!(partition_rows_for_topic(&topics, "nope").is_empty());
     }
 }

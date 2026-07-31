@@ -57,16 +57,17 @@ pulsar-topic-health --tui
 
 Four views, cycled with `v`:
 
-- **topic** — the classic per-topic table.
-- **partition** — one row per partition, flattened across all topics, so you can scan every partition's backlog/consumers/status at once.
+- **topic** — the classic per-topic table, with a cursor you move with ↑/↓.
+- **partition** — one row per partition, flattened across all topics.
 - **kube** — the Kubernetes pod-summary section (populated when also built and run with `--kube`).
-- **combined** — a split screen: topics on top, partitions below.
+- **combined** — a split screen: topics on top, and the partitions of the topic you've drilled into on the bottom.
 
-Selecting and filtering:
+Navigating and drilling in:
 
-- `/` edits a query that matches a topic or partition name (`p3` matches `…-partition-3`); Enter applies, Esc cancels.
-- `f` toggles between **Highlight** mode (keep all rows, emphasise matches) and **Filter** mode (hide non-matching rows).
-- `c` clears the query, `r` refreshes now, `q` (or Ctrl-C) quits.
+- **↑/↓** (or `k`/`j`) move the cursor between topics.
+- **Enter** on the selected topic drills into it — switches to the combined view with that topic's partitions in the lower pane.
+- **Esc** backs out of the drill-in to the topic view.
+- **r** refreshes now, **q** (or Ctrl-C) quits.
 
 The refresh cadence uses `--watch-interval-secs`, and drain trend is derived from consecutive refreshes just like `--watch`. The `tui` and `kube` features are independent — combine them (`--features tui,kube`) for the kube view to have data.
 

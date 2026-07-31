@@ -149,7 +149,7 @@ Typical uses to suggest:
 
 ## Interactive TUI (optional, `--tui`)
 
-With a binary built `--features tui`, `--tui` launches a full-screen terminal UI that refreshes live. Four views cycle with `v`: **topic** (the classic table), **partition** (one row per partition flattened across all topics), **kube** (pod summary, populated when also run with `--kube`), and **combined** (topics + partitions split screen). `/` edits a query matching a topic or partition name (`p3` matches `…-partition-3`); `f` toggles Filter (hide non-matching) vs Highlight (emphasise matching) mode; `c` clears, `r` refreshes, `q` quits. Refresh cadence is `--watch-interval-secs`; drain trend comes from consecutive refreshes. Like `--kube`, it's a build feature — without it, `--tui` prints guidance and exits. The features are independent; combine `--features tui,kube` for the kube view to have data.
+With a binary built `--features tui`, `--tui` launches a full-screen terminal UI that refreshes live. Four views cycle with `v`: **topic** (the classic table), **partition** (one row per partition flattened across all topics), **kube** (pod summary, populated when also run with `--kube`), and **combined** (topics on top, the drilled-into topic's partitions below). Navigate with **↑/↓** (or `k`/`j`) to move the cursor between topics; **Enter** drills into the selected topic (combined view scoped to its partitions); **Esc** backs out; **r** refreshes, **q** quits. Refresh cadence is `--watch-interval-secs`; drain trend comes from consecutive refreshes. Like `--kube`, it's a build feature — without it, `--tui` prints guidance and exits. The features are independent; combine `--features tui,kube` for the kube view to have data.
 
 ## Kubernetes correlation (optional, `--kube`)
 

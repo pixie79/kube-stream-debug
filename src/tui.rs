@@ -12,12 +12,13 @@
 //! shapes. These are mechanical to fix and don't affect the tested logic.
 //!
 //! Keybindings:
-//!   v            cycle view (topic → partition → kube → combined)
-//!   /            edit the filter/select query (Enter to apply, Esc to cancel)
-//!   f            toggle Filter vs Highlight mode
-//!   c            clear the query
-//!   r            refresh now
-//!   q / Ctrl-C   quit
+//!   ↑/↓ (or k/j)  move the cursor between topics
+//!   Enter         drill into the selected topic (combined view, its partitions
+//!                 in the lower pane)
+//!   Esc           back out of the drill-in to the topic view
+//!   v             cycle view (topic → partition → kube → combined)
+//!   r             refresh now
+//!   q / Ctrl-C    quit
 
 use std::time::{Duration, Instant};
 
@@ -29,8 +30,7 @@ use ratatui::DefaultTerminal;
 use crate::health::TopicHealth;
 use crate::kube::KubeReport;
 use crate::view::{
-    is_highlighted, partition_rows, visible_partition_indices, visible_topic_indices, SelectMode,
-    View, ViewState,
+    partition_rows, partition_rows_for_topic, PartitionRow, View, ViewState,
 };
 
 /// Everything the TUI needs to render one frame. The caller refreshes this on
@@ -71,43 +71,29 @@ fn event_loop(
         let elapsed = last_refresh.elapsed();
         let wait = interval.saturating_sub(elapsed);
         if event::poll(wait)? {
-            match event::read()? {
-                Event::Key(key) => {
-                    if state.editing_query {
-                        match key.code {
-                            KeyCode::Enter | KeyCode::Esc => state.editing_query = false,
-                            KeyCode::Backspace => {
-                                state.query.pop();
-                            }
-                            KeyCode::Char(c) => state.query.push(c),
-                            _ => {}
-                        }
-                    } else {
-                        match key.code {
-                            KeyCode::Char('q') => break,
-                            KeyCode::Char('c')
-                                if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                            {
-                                break
-                            }
-                            KeyCode::Char('v') => state.cycle_view(),
-                            KeyCode::Char('/') => state.editing_query = true,
-                            KeyCode::Char('f') => state.toggle_mode(),
-                            KeyCode::Char('c') => state.clear_query(),
-                            KeyCode::Char('r') => {
-                                frame = refresh();
-                                last_refresh = Instant::now();
-                            }
-                            _ => {}
-                        }
+            if let Event::Key(key) = event::read()? {
+                let topic_count = frame.topics.len();
+                match key.code {
+                    KeyCode::Char('q') => break,
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                    KeyCode::Char('v') => state.cycle_view(),
+                    KeyCode::Up | KeyCode::Char('k') => state.cursor_up(),
+                    KeyCode::Down | KeyCode::Char('j') => state.cursor_down(topic_count),
+                    KeyCode::Enter => state.drill_in(&frame.topics),
+                    KeyCode::Esc => state.drill_out(),
+                    KeyCode::Char('r') => {
+                        frame = refresh();
+                        state.clamp_cursor(frame.topics.len());
+                        last_refresh = Instant::now();
                     }
+                    _ => {}
                 }
-                _ => {}
             }
         }
 
         if last_refresh.elapsed() >= interval {
             frame = refresh();
+            state.clamp_cursor(frame.topics.len());
             last_refresh = Instant::now();
         }
     }
@@ -124,15 +110,16 @@ fn draw(f: &mut ratatui::Frame, state: &ViewState, frame: &Frame) {
         ])
         .split(f.area());
 
+    let focus = state
+        .drilled_topic
+        .as_deref()
+        .map(|t| format!(" · drilled: {}", short_topic(t)))
+        .unwrap_or_default();
     let header = format!(
-        " pulsar-topic-health · sub: {} · view: {} · mode: {} · query: {} · as of {}",
+        " pulsar-topic-health · sub: {} · view: {}{} · as of {}",
         short_topic(&frame.subscription),
         state.view.label(),
-        match state.mode {
-            SelectMode::Filter => "filter",
-            SelectMode::Highlight => "highlight",
-        },
-        if state.query.is_empty() { "(none)" } else { &state.query },
+        focus,
         frame.run_at,
     );
     f.render_widget(Paragraph::new(header), chunks[0]);
@@ -144,20 +131,14 @@ fn draw(f: &mut ratatui::Frame, state: &ViewState, frame: &Frame) {
         View::Combined => draw_combined(f, chunks[1], state, frame),
     }
 
-    let help = if state.editing_query {
-        " typing filter… Enter=apply Esc=cancel"
-    } else {
-        " v=view /=filter f=mode c=clear r=refresh q=quit"
-    };
+    let help = " ↑/↓=move  Enter=drill in  Esc=back  v=view  r=refresh  q=quit";
     f.render_widget(Paragraph::new(help), chunks[2]);
 }
 
 fn draw_topics(f: &mut ratatui::Frame, area: Rect, state: &ViewState, frame: &Frame) {
-    let visible = visible_topic_indices(state, &frame.topics);
     let header = Row::new(vec!["TOPIC", "STATUS", "BACKLOG", "SIZE", "CONS", "NET/s", "DETAIL"])
         .style(Style::default().add_modifier(Modifier::BOLD));
-    let rows = visible.iter().map(|&i| {
-        let t = &frame.topics[i];
+    let rows = frame.topics.iter().enumerate().map(|(i, t)| {
         let row = Row::new(vec![
             Cell::from(short_topic(&t.topic)),
             Cell::from(t.status.label()),
@@ -167,7 +148,7 @@ fn draw_topics(f: &mut ratatui::Frame, area: Rect, state: &ViewState, frame: &Fr
             Cell::from(net_str(t)),
             Cell::from(topic_detail(t)),
         ]);
-        emphasise(row, is_highlighted(state, &t.topic))
+        emphasise(row, i == state.cursor)
     });
     let widths = [
         Constraint::Percentage(28),
@@ -184,13 +165,18 @@ fn draw_topics(f: &mut ratatui::Frame, area: Rect, state: &ViewState, frame: &Fr
     f.render_widget(table, area);
 }
 
-fn draw_partitions(f: &mut ratatui::Frame, area: Rect, state: &ViewState, frame: &Frame) {
-    let all = partition_rows(&frame.topics);
-    let visible = visible_partition_indices(state, &all);
+/// Draw a partition table from a given row set. `cursor` highlights a row when
+/// `Some` (used in the standalone partition view); `None` for the drill-in pane.
+fn draw_partition_rows(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    rows_data: &[PartitionRow],
+    cursor: Option<usize>,
+    title: &str,
+) {
     let header = Row::new(vec!["TOPIC", "PART", "STATUS", "BACKLOG", "SIZE", "CONS", "UNACKED"])
         .style(Style::default().add_modifier(Modifier::BOLD));
-    let rows = visible.iter().map(|&i| {
-        let p = &all[i];
+    let rows = rows_data.iter().enumerate().map(|(i, p)| {
         let row = Row::new(vec![
             Cell::from(short_topic(&p.topic)),
             Cell::from(format!("p{}", p.index)),
@@ -200,7 +186,7 @@ fn draw_partitions(f: &mut ratatui::Frame, area: Rect, state: &ViewState, frame:
             Cell::from(p.consumers.to_string()),
             Cell::from(p.unacked_messages.to_string()),
         ]);
-        emphasise(row, is_highlighted(state, &p.partition))
+        emphasise(row, cursor == Some(i))
     });
     let widths = [
         Constraint::Percentage(30),
@@ -213,8 +199,13 @@ fn draw_partitions(f: &mut ratatui::Frame, area: Rect, state: &ViewState, frame:
     ];
     let table = Table::new(rows, widths)
         .header(header)
-        .block(Block::default().borders(Borders::ALL).title("partitions"));
+        .block(Block::default().borders(Borders::ALL).title(title.to_string()));
     f.render_widget(table, area);
+}
+
+fn draw_partitions(f: &mut ratatui::Frame, area: Rect, state: &ViewState, frame: &Frame) {
+    let all = partition_rows(&frame.topics);
+    draw_partition_rows(f, area, &all, Some(state.cursor), "partitions");
 }
 
 fn draw_kube(f: &mut ratatui::Frame, area: Rect, frame: &Frame) {
@@ -234,7 +225,22 @@ fn draw_combined(f: &mut ratatui::Frame, area: Rect, state: &ViewState, frame: &
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
     draw_topics(f, halves[0], state, frame);
-    draw_partitions(f, halves[1], state, frame);
+
+    // Lower pane: partitions of the drilled-into topic, or a hint if none.
+    match &state.drilled_topic {
+        Some(topic) => {
+            let rows = partition_rows_for_topic(&frame.topics, topic);
+            let title = format!("partitions · {}", short_topic(topic));
+            draw_partition_rows(f, halves[1], &rows, None, &title);
+        }
+        None => {
+            f.render_widget(
+                Paragraph::new(" press Enter on a topic above to drill into its partitions")
+                    .block(Block::default().borders(Borders::ALL).title("partitions")),
+                halves[1],
+            );
+        }
+    }
 }
 
 fn emphasise(row: Row, on: bool) -> Row {
