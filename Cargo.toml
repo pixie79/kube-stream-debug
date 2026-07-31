@@ -16,6 +16,16 @@ thiserror = "1"
 toml = "0.8"
 ureq = { version = "2.10", features = ["json"] }
 
+# Optional Kubernetes correlation. Off by default so the core tool stays a
+# small, sync binary; enable with `--features kube` to pull in kube-rs + tokio.
+kube = { version = "0.99", default-features = false, features = ["client", "rustls-tls", "config"], optional = true }
+k8s-openapi = { version = "0.24", features = ["latest"], optional = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"], optional = true }
+
+[features]
+default = []
+kube = ["dep:kube", "dep:k8s-openapi", "dep:tokio"]
+
 [profile.release]
 lto = "thin"
 strip = true

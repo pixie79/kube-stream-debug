@@ -107,6 +107,10 @@ pub struct TopicHealth {
     /// observation available, e.g. a single run with no snapshots).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_since: Option<String>,
+    /// Correlation hint from the Kubernetes side (e.g. "kube: 1 pod OOM-killed")
+    /// attached to unhealthy topics when --kube is used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kube_hint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -128,6 +132,7 @@ impl TopicHealth {
             partition_gaps: Vec::new(),
             drain: None,
             state_since: None,
+            kube_hint: None,
             error: Some(error.to_string()),
         }
     }
@@ -231,6 +236,7 @@ fn evaluate(
         partition_gaps: Vec::new(),
         drain: None,
         state_since: None,
+            kube_hint: None,
         error: None,
     };
 

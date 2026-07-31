@@ -46,6 +46,32 @@ unacked_crit = 200000
 
 Colours render in a terminal and are automatically stripped when output is piped or redirected, so captured runs stay plain-text for diffing.
 
+## Kubernetes correlation (optional)
+
+The subscription's consumers usually run in Kubernetes pods, and a broker-side symptom — `NO_CONSUMERS`, a growing backlog — is often caused by a pod-side fault: an OOMKill, a crash-loop, a pod stuck mid-ramp, or a bad config rollout. With the `kube` feature the tool can fetch that consumer-side health and show it alongside the topic table, so "backlog is growing" becomes "backlog is growing *because* two pods OOM-killed 4 minutes ago".
+
+This is an **opt-in build feature** (it pulls in `kube-rs` + `tokio`), so the default binary stays small and dependency-light:
+
+```sh
+cargo build --release --features kube
+```
+
+Then enable it at runtime with `--kube` plus a namespace and label selector:
+
+```sh
+pulsar-topic-health --kube \
+  --kube-namespace my-ns \
+  --kube-selector app=my-consumer \
+  --kube-configmap my-consumer-config \
+  --kube-assert worker_count=24 --kube-assert batch_size=30
+```
+
+Authentication is whatever `kubectl` already uses — the tool calls `kube-rs`'s default config inference, which reads `~/.kube/config`, `KUBECONFIG`, or an in-cluster service-account token. No separate setup.
+
+It renders a pod-summary section above the topic table (pod name, ready count, restarts, age, state — with `OOMKilled`/`CrashLoopBackOff` highlighted), flags a split rollout (more than one image) or large rollout skew (pods not restarted together), lists recent OOM/eviction events, prints any failed `--kube-assert` config checks, and scans the last N log lines per pod (`--kube-log-tail`, default 200) for ramp/OOM/error/config signals. Unhealthy topics also gain a short correlation hint in their `DETAIL` (e.g. `kube: 2 pod(s) OOM-killed`). In JSONL mode the full kube report is emitted as one extra line before the topic lines.
+
+The Kubernetes side is strictly best-effort and isolated: if the cluster is unreachable or auth fails, the tool prints an `unreachable` notice and still renders the full Pulsar report. A consumer-side problem (failed pods, failed config assertion, split rollout) contributes to the non-zero exit code alongside topic health, so `--kube` works as a post-deploy gate.
+
 ## Watch mode
 
 `--watch` runs continuously, clearing and redrawing the table every `--watch-interval-secs` (default 60) until interrupted. In watch mode the drain trend is derived from the **previous cycle** — consecutive cycles are the two samples, compared over the real elapsed time between them — so there's no mid-cycle sleep and `--drain-window-secs` is ignored. The first cycle shows no trend (nothing to compare yet); every cycle after shows net rate and ETA over the actual interval.

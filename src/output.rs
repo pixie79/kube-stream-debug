@@ -120,6 +120,131 @@ fn time_in_state_cell(health: &TopicHealth, run_at: &str) -> Cell {
     Cell::new(text).set_alignment(CellAlignment::Right)
 }
 
+/// Render the Kubernetes pod-summary section that prints above the topic table
+/// when --kube is used. Returns a string (may be multi-line) ending in a
+/// newline, or an unreachable notice.
+pub fn render_kube_section(report: &crate::kube::KubeReport) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "kubernetes: namespace {}", report.namespace);
+
+    if let Some(err) = &report.error {
+        let _ = writeln!(out, "  unreachable: {err}");
+        return out;
+    }
+
+    if report.pods.is_empty() {
+        let _ = writeln!(out, "  no pods matched the selector");
+        return out;
+    }
+
+    let mut table = Table::new();
+    table
+        .load_preset(comfy_table::presets::UTF8_FULL_CONDENSED)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            Cell::new("POD").add_attribute(Attribute::Bold),
+            Cell::new("READY").add_attribute(Attribute::Bold),
+            Cell::new("RESTARTS").add_attribute(Attribute::Bold),
+            Cell::new("AGE").add_attribute(Attribute::Bold),
+            Cell::new("STATE").add_attribute(Attribute::Bold),
+        ]);
+
+    for pod in &report.pods {
+        let ready = format!("{}/{}", pod.ready, pod.total_containers);
+        let ready_cell = if pod.all_ready() {
+            Cell::new(ready).fg(Color::Green)
+        } else {
+            Cell::new(ready).fg(Color::Red).add_attribute(Attribute::Bold)
+        };
+        let age = pod
+            .age_secs
+            .map(|s| format_short_duration(s))
+            .unwrap_or_else(|| "—".to_string());
+        let state = if pod.oom_killed {
+            Cell::new("OOMKilled")
+                .fg(Color::White)
+                .bg(Color::Red)
+                .add_attribute(Attribute::Bold)
+        } else {
+            let text = pod.reason.clone().unwrap_or_else(|| "Running".to_string());
+            if text == "Running" {
+                Cell::new(text).fg(Color::Green)
+            } else {
+                Cell::new(text).fg(Color::Yellow)
+            }
+        };
+        table.add_row(vec![
+            Cell::new(&pod.name),
+            ready_cell,
+            Cell::new(pod.restarts).set_alignment(CellAlignment::Right),
+            Cell::new(age).set_alignment(CellAlignment::Right),
+            state,
+        ]);
+    }
+    let _ = writeln!(out, "{table}");
+
+    // Notable lines below the pod table.
+    if report.images.len() > 1 {
+        let _ = writeln!(
+            out,
+            "  ⚠ split rollout: {} distinct images ({})",
+            report.images.len(),
+            report.images.join(", ")
+        );
+    }
+    if let Some(skew) = report.rollout_skew_secs {
+        if skew > 300 {
+            let _ = writeln!(
+                out,
+                "  ⚠ rollout skew {} — pods not restarted together",
+                format_short_duration(skew)
+            );
+        }
+    }
+    for assertion in report.config_assertions.iter().filter(|a| !a.pass) {
+        let _ = writeln!(
+            out,
+            "  ✗ config {}: expected {}, got {}",
+            assertion.key,
+            assertion.expected,
+            assertion.actual.as_deref().unwrap_or("(absent)")
+        );
+    }
+    if !report.events.is_empty() {
+        let _ = writeln!(out, "  events:");
+        for ev in report.events.iter().take(10) {
+            let age = ev
+                .age_secs
+                .map(|s| format!(" ({} ago)", format_short_duration(s)))
+                .unwrap_or_default();
+            let _ = writeln!(out, "    {} {}{}", ev.reason, ev.involved, age);
+        }
+    }
+    if !report.log_signals.is_empty() {
+        let _ = writeln!(out, "  log signals:");
+        for sig in report.log_signals.iter().take(15) {
+            let _ = writeln!(out, "    [{}] {}: {}", sig.kind, sig.pod, sig.line);
+        }
+    }
+
+    out
+}
+
+/// Compact duration for pod ages / event ages: `45s`, `12m`, `3h`, `2d`.
+fn format_short_duration(secs: i64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
 /// A right-aligned cell coloured by a configured threshold level. `None` leaves
 /// it uncoloured (no thresholds set for that column).
 fn level_cell(text: String, level: ThresholdLevel) -> Cell {
@@ -236,6 +361,10 @@ fn detail(health: &TopicHealth) -> String {
         parts.push(format!("gaps: {}", gaps.join(", ")));
     }
 
+    if let Some(hint) = &health.kube_hint {
+        parts.push(hint.clone());
+    }
+
     parts.join("; ")
 }
 
@@ -319,6 +448,7 @@ mod tests {
             partition_gaps: Vec::new(),
             drain: None,
             state_since: None,
+            kube_hint: None,
             error: None,
         };
         let mut table = render_table(std::slice::from_ref(&health), &colors, "2026-07-30T12:00:00Z");
@@ -348,9 +478,60 @@ mod tests {
             partition_gaps: Vec::new(),
             drain: None,
             state_since: None,
+            kube_hint: None,
             error: None,
         };
         let out = render_jsonl(std::slice::from_ref(&health), "2026-07-30T10:00:00Z").unwrap();
         assert!(out.contains(r#""as_of":"2026-07-30T10:00:00Z""#));
+    }
+}
+#[cfg(test)]
+mod kube_render_tests {
+    use super::render_kube_section;
+    use crate::kube::{ConfigAssertion, KubeReport, PodSummary};
+
+    fn pod(name: &str, ready: u32, total: u32, restarts: i32, age: i64, img: &str, oom: bool, reason: Option<&str>) -> PodSummary {
+        PodSummary { name: name.into(), ready, total_containers: total, restarts,
+            age_secs: Some(age), image: Some(img.into()),
+            reason: reason.map(|s| s.into()), oom_killed: oom }
+    }
+
+    #[test]
+    fn renders_healthy_pod_section() {
+        let mut report = KubeReport { namespace: "my-ns".into(), ..Default::default() };
+        report.pods = vec![
+            pod("app-1", 1, 1, 0, 3600, "img:v2", false, None),
+            pod("app-2", 1, 1, 0, 3600, "img:v2", false, None),
+        ];
+        report.images = crate::kube::distinct_images(&report.pods);
+        let out = render_kube_section(&report);
+        assert!(out.contains("namespace my-ns"));
+        assert!(out.contains("app-1"));
+        assert!(!out.contains("split rollout"));
+    }
+
+    #[test]
+    fn renders_problems() {
+        let mut report = KubeReport { namespace: "ns".into(), ..Default::default() };
+        report.pods = vec![
+            pod("app-1", 0, 1, 7, 120, "img:v2", true, Some("OOMKilled")),
+            pod("app-2", 1, 1, 0, 6000, "img:v1", false, None),
+        ];
+        report.images = crate::kube::distinct_images(&report.pods);
+        report.rollout_skew_secs = crate::kube::rollout_skew_secs(&report.pods);
+        report.config_assertions = vec![ConfigAssertion {
+            key: "worker_count".into(), expected: "24".into(),
+            actual: Some("16".into()), pass: false }];
+        let out = render_kube_section(&report);
+        assert!(out.contains("OOMKilled"), "oom state shown");
+        assert!(out.contains("split rollout"), "two images flagged");
+        assert!(out.contains("config worker_count"), "failed assertion shown");
+    }
+
+    #[test]
+    fn renders_unreachable() {
+        let report = KubeReport::unreachable("ns", "connection refused".into());
+        let out = render_kube_section(&report);
+        assert!(out.contains("unreachable"));
     }
 }

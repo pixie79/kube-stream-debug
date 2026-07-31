@@ -215,6 +215,7 @@ mod tests {
                 eta_secs: None,
             }),
             state_since: None,
+            kube_hint: None,
             error: None,
         }
     }

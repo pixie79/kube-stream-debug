@@ -11,6 +11,7 @@ mod config;
 mod cursor;
 mod drain;
 mod health;
+mod kube;
 mod output;
 mod pulsar;
 mod snapshot;
@@ -96,6 +97,41 @@ struct Cli {
     /// Only show unhealthy topics in the output.
     #[arg(long)]
     problems_only: bool,
+
+    /// Also fetch and display Kubernetes health for the consumer deployment,
+    /// correlating pod status with topic health. Requires the tool to be built
+    /// with `--features kube`.
+    #[arg(long)]
+    kube: bool,
+
+    /// Kubernetes namespace of the consumer pods.
+    #[arg(long, default_value = "default")]
+    kube_namespace: String,
+
+    /// Label selector for the consumer pods, e.g. `app=my-consumer`.
+    #[arg(long)]
+    kube_selector: Option<String>,
+
+    /// ConfigMap name to read `config.toml` from for --kube-assert checks.
+    #[arg(long)]
+    kube_configmap: Option<String>,
+
+    /// Assert a config.toml `key=value` (repeatable), e.g.
+    /// `--kube-assert worker_count=24`.
+    #[arg(long = "kube-assert", value_parser = parse_key_value)]
+    kube_assert: Vec<(String, String)>,
+
+    /// Scan the last N log lines per pod for ramp/OOM/error signals (0 = skip).
+    #[arg(long, default_value_t = 200)]
+    kube_log_tail: i64,
+}
+
+/// Parse a `key=value` pair for --kube-assert.
+fn parse_key_value(s: &str) -> Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((k, v)) if !k.is_empty() => Ok((k.trim().to_string(), v.trim().to_string())),
+        _ => Err(format!("expected key=value, got '{s}'")),
+    }
 }
 
 fn main() -> ExitCode {
@@ -166,6 +202,13 @@ fn single_run(
         .unwrap_or_default();
     state::assign_state_since(&mut results, &prior, &run_at);
 
+    // Kubernetes correlation (optional): fetch the consumer deployment's health
+    // and annotate unhealthy topics with a pod-side hint.
+    let kube_report = fetch_kube_report(cli);
+    if let Some(report) = &kube_report {
+        annotate_with_kube(&mut results, report);
+    }
+
     if let Some(dir) = &cli.json_dir {
         if let Err(err) = snapshot::write_snapshot(dir, &results, &run_at, cli.json_dir_max_files) {
             eprintln!("Warning: {err}");
@@ -181,20 +224,46 @@ fn single_run(
     match cli.format {
         Format::Table => {
             println!("as of {run_at}");
+            if let Some(report) = &kube_report {
+                print!("{}", output::render_kube_section(report));
+            }
             println!("{}", output::render_table(&display, colors, &run_at));
         }
-        Format::Jsonl => print!("{}", output::render_jsonl(&display, &run_at)?),
+        Format::Jsonl => {
+            if let Some(report) = &kube_report {
+                if let Ok(line) = serde_json::to_string(report) {
+                    println!("{line}");
+                }
+            }
+            print!("{}", output::render_jsonl(&display, &run_at)?);
+        }
     }
 
     let unhealthy = display.iter().filter(|h| !h.status.is_healthy()).count();
+    let kube_unhealthy = kube_report.as_ref().map(|r| !r.is_healthy()).unwrap_or(false);
     if unhealthy > 0 {
         eprintln!(
             "{unhealthy} of {} topic(s) unhealthy (subscription: {subscription}, threshold: {threshold})",
             topics.len()
         );
+    }
+    if let Some(report) = &kube_report {
+        eprintln!("{}", report.summary_line());
+    }
+    if unhealthy > 0 || kube_unhealthy {
         return Ok(ExitCode::from(2));
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Attach a Kubernetes correlation hint to the DETAIL of each unhealthy topic.
+fn annotate_with_kube(results: &mut [TopicHealth], report: &kube::KubeReport) {
+    for health in results.iter_mut() {
+        let topic_unhealthy = !health.status.is_healthy();
+        if let Some(hint) = kube::correlation_hint(report, topic_unhealthy) {
+            health.kube_hint = Some(hint);
+        }
+    }
 }
 
 /// Continuous watch: redraw every `--watch-interval-secs`, deriving drain trend
@@ -240,6 +309,12 @@ fn watch_loop(
         state::assign_state_since(&mut results, &prior_state, &run_at);
         prior_state = state::prior_from_results(&results);
 
+        // Kubernetes correlation each cycle (optional).
+        let kube_report = fetch_kube_report(cli);
+        if let Some(report) = &kube_report {
+            annotate_with_kube(&mut results, report);
+        }
+
         // Snapshot the full (unfiltered) results before any --problems-only trim.
         if let Some(dir) = &cli.json_dir {
             if let Err(err) =
@@ -274,11 +349,17 @@ fn watch_loop(
                     "as of {run_at}   (watch: every {}s, ctrl-c to stop)",
                     cli.watch_interval_secs
                 );
+                if let Some(report) = &kube_report {
+                    print!("{}", output::render_kube_section(report));
+                }
                 println!("{}", output::render_table(&display, colors, &run_at));
                 println!(
                     "{unhealthy} of {} topic(s) unhealthy (subscription: {subscription}, threshold: {threshold})",
                     topics.len()
                 );
+                if let Some(report) = &kube_report {
+                    println!("{}", report.summary_line());
+                }
             }
             Format::Jsonl => print!("{}", output::render_jsonl(&display, &run_at)?),
         }
@@ -320,6 +401,55 @@ fn clear_screen() {
     print!("\x1b[2J\x1b[H");
     use std::io::Write;
     let _ = std::io::stdout().flush();
+}
+
+/// Fetch the Kubernetes report if `--kube` is set. Feature-gated: without the
+/// `kube` feature this returns a helpful message so the flag isn't silently
+/// ignored.
+#[cfg(feature = "kube")]
+fn fetch_kube_report(cli: &Cli) -> Option<kube::KubeReport> {
+    if !cli.kube {
+        return None;
+    }
+    let Some(selector) = cli.kube_selector.clone() else {
+        return Some(kube::KubeReport::unreachable(
+            &cli.kube_namespace,
+            "--kube-selector is required with --kube".to_string(),
+        ));
+    };
+    let query = kube::client::KubeQuery {
+        namespace: cli.kube_namespace.clone(),
+        selector,
+        configmap: cli.kube_configmap.clone(),
+        expected_config: cli.kube_assert.clone(),
+        log_tail: (cli.kube_log_tail > 0).then_some(cli.kube_log_tail),
+        event_window_secs: 30 * 60,
+    };
+    // Small dedicated runtime: the rest of the tool is sync, so we don't want a
+    // top-level async main. Block on the gather.
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            return Some(kube::KubeReport::unreachable(
+                &cli.kube_namespace,
+                format!("failed to start async runtime: {e}"),
+            ))
+        }
+    };
+    Some(runtime.block_on(kube::client::gather(&query)))
+}
+
+#[cfg(not(feature = "kube"))]
+fn fetch_kube_report(cli: &Cli) -> Option<kube::KubeReport> {
+    if cli.kube {
+        eprintln!(
+            "Warning: --kube requires the tool to be built with `--features kube`; ignoring."
+        );
+    }
+    None
 }
 
 fn resolve_token() -> anyhow::Result<String> {

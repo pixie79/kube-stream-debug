@@ -120,6 +120,12 @@ Flags worth knowing:
 | `--watch-interval-secs <n>` | Seconds between watch cycles (default 60). |
 | `--json-dir <dir>` | Write a JSON snapshot per run/cycle into `<dir>` (created if absent). |
 | `--json-dir-max-files <n>` | Cap snapshot files in `--json-dir` (default 100; `0` = keep all; oldest pruned). |
+| `--kube` | Fetch + show Kubernetes consumer-pod health (needs a binary built with `--features kube`). |
+| `--kube-namespace <ns>` | Namespace of the consumer pods (default `default`). |
+| `--kube-selector <sel>` | Label selector for the pods, e.g. `app=my-consumer` (required with `--kube`). |
+| `--kube-configmap <name>` | ConfigMap holding `config.toml` for `--kube-assert` checks. |
+| `--kube-assert key=value` | Assert a `config.toml` value (repeatable). |
+| `--kube-log-tail <n>` | Log lines scanned per pod for signals (default 200; 0 = skip). |
 | `--concurrency <n>` | Parallel admin requests (default 8). |
 | `--timeout-secs <n>` | Per-request timeout (default 30). |
 | `--problems-only` | Hide healthy (`OK`) rows. |
@@ -139,6 +145,41 @@ Typical uses to suggest:
 
 - Live monitoring during an incident: `--watch --watch-interval-secs 30`.
 - Building a diffable history: `--watch --json-dir ./snapshots` then compare successive files, or process them with `jq`.
+
+## Kubernetes correlation (optional, `--kube`)
+
+The subscription's consumers usually run in Kubernetes pods, and a broker-side symptom is often caused by a pod-side fault: an OOMKill, a crash-loop, a pod stuck mid-ramp, a bad config rollout. The `--kube` flag fetches consumer-side health and shows it alongside the topic table, turning "backlog is growing" into "backlog is growing *because* two pods OOM-killed 4 minutes ago".
+
+**This is an opt-in build feature.** It pulls in `kube-rs` + `tokio`, so it's compiled only when the binary is built with `cargo build --features kube`. Without that, `--kube` prints a warning and is ignored. If a user wants Kubernetes correlation, first confirm the binary was built with the feature.
+
+At runtime it needs a namespace and label selector:
+
+```sh
+pulsar-topic-health --kube \
+  --kube-namespace my-ns \
+  --kube-selector app=my-consumer \
+  --kube-configmap my-consumer-config \
+  --kube-assert worker_count=24 --kube-assert batch_size=30
+```
+
+Flags: `--kube` (enable), `--kube-namespace` (default `default`), `--kube-selector` (label selector, **required** with `--kube`), `--kube-configmap` (ConfigMap holding `config.toml`), `--kube-assert key=value` (repeatable config assertions), `--kube-log-tail N` (log lines scanned per pod, default 200, 0 to skip).
+
+Authentication is inherited from the environment exactly as `kubectl` gets it — `kube-rs`'s default config inference reads `~/.kube/config`, `KUBECONFIG`, or an in-cluster service-account token. No token flag, and the agent must never put kube credentials in files or output.
+
+What it shows:
+- A **pod-summary section** above the topic table: pod name, ready count, restarts, age, and state (with `OOMKilled` / `CrashLoopBackOff` highlighted).
+- **Rollout flags**: a split rollout (more than one image across pods) or large rollout skew (pods not restarted together — a rollout may be incomplete or a pod is stale).
+- **Events**: recent OOMKilling / Evicted / Failed events in the namespace.
+- **Config assertions**: any failed `--kube-assert` printed as `✗ config <key>: expected X, got Y`.
+- **Log signals**: matches for ramp / OOM / error / config patterns in each pod's recent logs.
+- **Correlation hint in DETAIL**: unhealthy topics gain a short pod-side cause, e.g. `kube: 2 pod(s) OOM-killed`.
+
+In JSONL mode the full kube report is emitted as one extra line before the topic lines.
+
+How to reason about it:
+- The kube side is **best-effort and isolated** — if the cluster is unreachable or auth fails, the tool prints an `unreachable` notice and still renders the complete Pulsar report. Never treat a kube failure as a reason to withhold the topic health.
+- A consumer-side problem (failed pods, failed config assertion, split rollout) contributes to the non-zero exit code alongside topic health, so `--kube` doubles as a post-deploy gate.
+- The most useful correlation: a `NO_CONSUMERS` or `growing` topic *with* an OOMKilled pod is a memory-pressure story — the consumer died, so nobody's draining. A `growing` topic with all pods healthy is a capacity story — consumers are fine but outnumbered by producers. The pod section is what tells these apart.
 
 ## Reading the output
 
