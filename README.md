@@ -196,7 +196,7 @@ Priority when several apply, worst first: `TRIMMED` → `NO_CONSUMERS` → `PART
 
 ## Toolchain
 
-Pinned to Rust 1.94.0 via `rust-toolchain.toml` (edition 2024, `rust-version = "1.94"`). `Cargo.lock` is committed with current crate versions resolved fresh — run `cargo update` whenever you want to roll deps forward.
+Pinned to Rust 1.94.0 via `rust-toolchain.toml` (edition 2024, `rust-version = "1.94"`). 
 
 ## Agent skill
 
