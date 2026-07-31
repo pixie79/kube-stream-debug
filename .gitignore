@@ -1,1 +1,14 @@
 /target
+
+# Local run artifacts and private configs — never commit these. Real configs
+# point at real brokers/topics/namespaces, and --json-dir snapshot files
+# contain live topic and subscription names. Keep them out of the repo.
+#
+# Ignore all top-level .toml configs except the ones the project ships.
+/*.toml
+!Cargo.toml
+!topics.example.toml
+
+# --json-dir snapshot output directories live at the repo root; ignore any
+# directory holding pth-*.json snapshots. Add your own dir names as needed.
+/snapshots/
