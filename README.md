@@ -66,6 +66,7 @@ Navigating and drilling in:
 - **↑/↓** (or `k`/`j`) move the cursor between topics.
 - **Enter** on the selected topic drills into it — switches to the combined view with that topic's partitions in the lower pane.
 - **Esc** backs out of the drill-in to the topic view.
+- In the **kube** view, **Tab** switches the cursor between the pods and nodes sections; **Enter** opens detail for the selected pod (its resource breakdown, log stats, and scrollable raw logs) or node (its capacity and which pods run on it). The kube panel also shows a live log-stats summary (level counts, RSS trend, throughput, operational tallies, top messages).
 - **?** toggles a legend overlay explaining every status and trend.
 - **r** refreshes now, **q** (or Ctrl-C) quits.
 

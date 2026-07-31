@@ -20,21 +20,25 @@ pub enum View {
     Kube,
     /// Split: topics on top, partitions (of the selected topic) below.
     Combined,
-    /// Detail for a single node (its pods + their full logs). Reached by
-    /// pressing Enter on a node in the kube view; not part of the `v` cycle.
+    /// Detail for a single pod (its resource breakdown, log stats, and raw
+    /// logs). Reached by pressing Enter on a pod in the kube view.
+    PodDetail,
+    /// Detail for a single node (its capacity and which pods run on it).
+    /// Reached by pressing Enter on a node in the kube view. Neither detail
+    /// view is part of the `v` cycle.
     NodeDetail,
 }
 
 impl View {
-    /// Cycle order for the toggle key. NodeDetail is excluded — it's reached by
-    /// drilling in, and cycling from it returns to the topic view.
+    /// Cycle order for the toggle key. The detail views are excluded — they're
+    /// reached by drilling in, and cycling from them returns to the topic view.
     pub fn next(self) -> View {
         match self {
             View::Topic => View::Partition,
             View::Partition => View::Kube,
             View::Kube => View::Combined,
             View::Combined => View::Topic,
-            View::NodeDetail => View::Topic,
+            View::PodDetail | View::NodeDetail => View::Topic,
         }
     }
 
@@ -44,11 +48,20 @@ impl View {
             View::Partition => "partition",
             View::Kube => "kube",
             View::Combined => "combined",
+            View::PodDetail => "pod",
             View::NodeDetail => "node",
         }
     }
 }
 
+
+/// Within the kube view, which of the two sections (pods / nodes) the cursor is
+/// currently in. Tab switches between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KubeFocus {
+    Pods,
+    Nodes,
+}
 
 /// Mutable UI state driven by keypresses. Navigation is a cursor (↑/↓) plus a
 /// drill-in focus (Enter on a topic scopes the combined view to it; Esc backs
@@ -61,6 +74,10 @@ pub struct ViewState {
     /// When set, the user has drilled into this topic: the combined view shows
     /// its partitions in the lower pane. Cleared by Esc.
     pub drilled_topic: Option<String>,
+    /// In the kube view, which section (pods/nodes) the cursor is in.
+    pub kube_focus: KubeFocus,
+    /// When set, the pod-detail view is showing this pod.
+    pub selected_pod: Option<String>,
     /// When set, the node-detail view is showing this node.
     pub selected_node: Option<String>,
     /// Whether the status-legend help overlay is showing.
@@ -73,6 +90,8 @@ impl Default for ViewState {
             view: View::Topic,
             cursor: 0,
             drilled_topic: None,
+            kube_focus: KubeFocus::Pods,
+            selected_pod: None,
             selected_node: None,
             show_help: false,
         }
@@ -120,24 +139,54 @@ impl ViewState {
         }
     }
 
-    /// Back out of a drill-in (topic or node): clear focus and return to the
-    /// view the user came from (topic for a topic drill, kube for a node).
+    /// Back out of a drill-in. Topic/combined → topic view; the kube detail
+    /// views (pod/node) → back to the kube view with focus preserved.
     pub fn drill_out(&mut self) {
-        if self.view == View::NodeDetail {
-            self.selected_node = None;
-            self.view = View::Kube;
-        } else {
-            self.drilled_topic = None;
-            self.view = View::Topic;
+        match self.view {
+            View::PodDetail => {
+                self.selected_pod = None;
+                self.view = View::Kube;
+            }
+            View::NodeDetail => {
+                self.selected_node = None;
+                self.view = View::Kube;
+            }
+            _ => {
+                self.drilled_topic = None;
+                self.view = View::Topic;
+            }
         }
     }
 
-    /// Drill into the node at the cursor within the kube view's node list.
-    pub fn drill_into_node(&mut self, nodes: &[String]) {
-        if let Some(name) = nodes.get(self.cursor) {
-            self.selected_node = Some(name.clone());
-            self.view = View::NodeDetail;
-            self.cursor = 0;
+    /// Toggle the kube-view cursor between the pods and nodes sections, resetting
+    /// the cursor to the top of the newly-focused section.
+    pub fn toggle_kube_focus(&mut self) {
+        self.kube_focus = match self.kube_focus {
+            KubeFocus::Pods => KubeFocus::Nodes,
+            KubeFocus::Nodes => KubeFocus::Pods,
+        };
+        self.cursor = 0;
+    }
+
+    /// Drill into whatever the kube cursor is on: a pod (→ PodDetail) when the
+    /// pods section is focused, or a node (→ NodeDetail) when nodes is focused.
+    /// `pods` and `nodes` are the names in the same order they're rendered.
+    pub fn kube_drill_in(&mut self, pods: &[String], nodes: &[String]) {
+        match self.kube_focus {
+            KubeFocus::Pods => {
+                if let Some(name) = pods.get(self.cursor) {
+                    self.selected_pod = Some(name.clone());
+                    self.view = View::PodDetail;
+                    self.cursor = 0;
+                }
+            }
+            KubeFocus::Nodes => {
+                if let Some(name) = nodes.get(self.cursor) {
+                    self.selected_node = Some(name.clone());
+                    self.view = View::NodeDetail;
+                    self.cursor = 0;
+                }
+            }
         }
     }
 
@@ -428,14 +477,37 @@ mod tests {
     }
 
     #[test]
-    fn node_drill_in_and_out() {
-        let nodes = vec!["node-a".to_string(), "node-b".to_string()];
+    fn kube_focus_toggles() {
+        let mut state = ViewState { view: View::Kube, cursor: 3, ..Default::default() };
+        assert_eq!(state.kube_focus, KubeFocus::Pods);
+        state.toggle_kube_focus();
+        assert_eq!(state.kube_focus, KubeFocus::Nodes);
+        assert_eq!(state.cursor, 0, "cursor resets when switching section");
+        state.toggle_kube_focus();
+        assert_eq!(state.kube_focus, KubeFocus::Pods);
+    }
+
+    #[test]
+    fn kube_drill_opens_pod_or_node_by_focus() {
+        let pods = vec!["pod-a".to_string(), "pod-b".to_string()];
+        let nodes = vec!["node-x".to_string(), "node-y".to_string()];
+
+        // Pods focused → Enter opens pod-detail for the cursored pod.
         let mut state = ViewState { view: View::Kube, cursor: 1, ..Default::default() };
-        state.drill_into_node(&nodes);
-        assert_eq!(state.view, View::NodeDetail);
-        assert_eq!(state.selected_node.as_deref(), Some("node-b"));
+        state.kube_drill_in(&pods, &nodes);
+        assert_eq!(state.view, View::PodDetail);
+        assert_eq!(state.selected_pod.as_deref(), Some("pod-b"));
         state.drill_out();
-        assert_eq!(state.view, View::Kube, "node drill-out returns to kube");
+        assert_eq!(state.view, View::Kube, "pod-detail backs out to kube");
+        assert!(state.selected_pod.is_none());
+
+        // Nodes focused → Enter opens node-detail.
+        let mut state = ViewState { view: View::Kube, kube_focus: KubeFocus::Nodes, cursor: 0, ..Default::default() };
+        state.kube_drill_in(&pods, &nodes);
+        assert_eq!(state.view, View::NodeDetail);
+        assert_eq!(state.selected_node.as_deref(), Some("node-x"));
+        state.drill_out();
+        assert_eq!(state.view, View::Kube, "node-detail backs out to kube");
         assert!(state.selected_node.is_none());
     }
 

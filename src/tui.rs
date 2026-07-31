@@ -4,10 +4,12 @@
 //! unit-tested; this file is the terminal shell around it.
 //!
 //! Keybindings:
-//!   ↑/↓ (or k/j)  move the cursor between topics
-//!   Enter         drill into the selected topic (combined view, its partitions
-//!                 in the lower pane)
-//!   Esc           back out of the drill-in to the topic view
+//!   ↑/↓ (or k/j)  move the cursor
+//!   Tab           (kube view) switch the cursor between the pods and nodes
+//!                 sections
+//!   Enter         drill in: a topic → combined; a pod → pod-detail (logs +
+//!                 stats); a node → node-detail (capacity + its pods)
+//!   Esc           back out of any drill-in
 //!   v             cycle view (topic → partition → kube → combined)
 //!   ?             toggle the status-legend help overlay
 //!   r             refresh now
@@ -66,15 +68,34 @@ fn event_loop(
         let wait = interval.saturating_sub(elapsed);
         if event::poll(wait)? {
             if let Event::Key(key) = event::read()? {
-                let topic_count = frame.topics.len();
+                // Names in render order, for cursor bounds and drill resolution.
+                let pod_names: Vec<String> =
+                    frame.kube.as_ref().map(|k| k.pods.iter().map(|p| p.name.clone()).collect()).unwrap_or_default();
+                let node_names: Vec<String> =
+                    frame.kube.as_ref().map(|k| k.nodes.iter().map(|n| n.name.clone()).collect()).unwrap_or_default();
+
+                // How many rows the cursor can move over in the current view.
+                let cursor_len = match state.view {
+                    View::Kube => match state.kube_focus {
+                        crate::view::KubeFocus::Pods => pod_names.len(),
+                        crate::view::KubeFocus::Nodes => node_names.len(),
+                    },
+                    _ => frame.topics.len(),
+                };
+
                 match key.code {
                     KeyCode::Char('q') => break,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                     KeyCode::Char('?') => state.toggle_help(),
                     KeyCode::Char('v') => state.cycle_view(),
+                    KeyCode::Tab if state.view == View::Kube => state.toggle_kube_focus(),
                     KeyCode::Up | KeyCode::Char('k') => state.cursor_up(),
-                    KeyCode::Down | KeyCode::Char('j') => state.cursor_down(topic_count),
-                    KeyCode::Enter => state.drill_in(&frame.topics),
+                    KeyCode::Down | KeyCode::Char('j') => state.cursor_down(cursor_len),
+                    KeyCode::Enter => match state.view {
+                        View::Kube => state.kube_drill_in(&pod_names, &node_names),
+                        View::PodDetail | View::NodeDetail => {} // already in detail
+                        _ => state.drill_in(&frame.topics),
+                    },
                     KeyCode::Esc => state.drill_out(),
                     KeyCode::Char('r') => {
                         frame = refresh();
@@ -122,11 +143,17 @@ fn draw(f: &mut ratatui::Frame, state: &ViewState, frame: &Frame) {
     match state.view {
         View::Topic => draw_topics(f, chunks[1], state, frame),
         View::Partition => draw_partitions(f, chunks[1], state, frame),
-        View::Kube => draw_kube(f, chunks[1], frame),
+        View::Kube => draw_kube(f, chunks[1], state, frame),
         View::Combined => draw_combined(f, chunks[1], state, frame),
+        View::PodDetail => draw_pod_detail(f, chunks[1], state, frame),
+        View::NodeDetail => draw_node_detail(f, chunks[1], state, frame),
     }
 
-    let help = " ↑/↓=move  Enter=drill in  Esc=back  v=view  ?=legend  r=refresh  q=quit";
+    let help = match state.view {
+        View::Kube => " ↑/↓=move  Tab=pods/nodes  Enter=open  Esc=back  v=view  ?=legend  q=quit",
+        View::PodDetail | View::NodeDetail => " Esc=back  ?=legend  r=refresh  q=quit",
+        _ => " ↑/↓=move  Enter=drill in  Esc=back  v=view  ?=legend  r=refresh  q=quit",
+    };
     f.render_widget(Paragraph::new(help), chunks[2]);
 
     // Help overlay draws on top of everything else.
@@ -289,13 +316,222 @@ fn draw_partitions(f: &mut ratatui::Frame, area: Rect, state: &ViewState, frame:
     draw_partition_rows(f, area, &all, Some(state.cursor), "partitions");
 }
 
-fn draw_kube(f: &mut ratatui::Frame, area: Rect, frame: &Frame) {
-    let text = match &frame.kube {
-        None => "kube view: run with --kube (and a binary built with --features kube)".to_string(),
-        Some(report) => crate::output::render_kube_section(report),
+fn draw_kube(f: &mut ratatui::Frame, area: Rect, state: &ViewState, frame: &Frame) {
+    use crate::view::KubeFocus;
+
+    let Some(report) = &frame.kube else {
+        f.render_widget(
+            Paragraph::new("kube view: run with --kube (and a binary built with --features kube)")
+                .block(Block::default().borders(Borders::ALL).title("kubernetes")),
+            area,
+        );
+        return;
     };
+
+    // Three stacked panels: pods (cursorable), nodes (cursorable), log stats.
+    let panels = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(45), // pods
+            Constraint::Length((report.nodes.len() as u16) + 3), // nodes + borders/header
+            Constraint::Min(4),         // log stats
+        ])
+        .split(area);
+
+    // --- Pods panel ---
+    let pods_focused = state.kube_focus == KubeFocus::Pods;
+    let pod_header = Row::new(vec!["POD", "READY", "REST", "AGE", "CPU", "MEM", "STATE"])
+        .style(Style::default().add_modifier(Modifier::BOLD));
+    let pod_rows = report.pods.iter().enumerate().map(|(i, p)| {
+        let ready = format!("{}/{}", p.ready, p.total_containers);
+        let state_txt = if p.oom_killed {
+            "OOMKilled".to_string()
+        } else {
+            p.reason.clone().unwrap_or_else(|| "Running".to_string())
+        };
+        let row = Row::new(vec![
+            Cell::from(p.name.clone()),
+            Cell::from(ready),
+            Cell::from(p.restarts.to_string()),
+            Cell::from(p.age_secs.map(fmt_age).unwrap_or_else(|| "—".to_string())),
+            Cell::from(pod_cpu(p)),
+            Cell::from(pod_mem(p)),
+            status_cell(&state_txt),
+        ]);
+        emphasise(row, pods_focused && i == state.cursor)
+    });
+    let pod_widths = [
+        Constraint::Percentage(34),
+        Constraint::Length(6),
+        Constraint::Length(5),
+        Constraint::Length(5),
+        Constraint::Length(9),
+        Constraint::Length(19),
+        Constraint::Percentage(16),
+    ];
+    let pods_title = if pods_focused { "pods ◀" } else { "pods" };
     f.render_widget(
-        Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("kubernetes")),
+        Table::new(pod_rows, pod_widths)
+            .header(pod_header)
+            .block(Block::default().borders(Borders::ALL).title(pods_title)),
+        panels[0],
+    );
+
+    // --- Nodes panel ---
+    let nodes_focused = state.kube_focus == KubeFocus::Nodes;
+    let node_rows = report.nodes.iter().enumerate().map(|(i, n)| {
+        let cpu = n.alloc_cpu_milli.map(crate::kube::format_cpu).unwrap_or_else(|| "?".into());
+        let mem = n.alloc_mem_bytes.map(crate::view::fmt_bytes).unwrap_or_else(|| "?".into());
+        let inst = n.instance_type.as_deref().unwrap_or("—");
+        let row = Row::new(vec![
+            Cell::from(n.name.clone()),
+            Cell::from(inst.to_string()),
+            Cell::from(format!("{cpu} CPU")),
+            Cell::from(format!("{mem} alloc")),
+        ]);
+        emphasise(row, nodes_focused && i == state.cursor)
+    });
+    let node_widths = [
+        Constraint::Percentage(46),
+        Constraint::Length(14),
+        Constraint::Length(10),
+        Constraint::Percentage(24),
+    ];
+    let nodes_title = if nodes_focused { "nodes ◀" } else { "nodes" };
+    f.render_widget(
+        Table::new(node_rows, node_widths)
+            .block(Block::default().borders(Borders::ALL).title(nodes_title)),
+        panels[1],
+    );
+
+    // --- Log stats panel ---
+    f.render_widget(
+        Paragraph::new(log_stats_lines(report))
+            .block(Block::default().borders(Borders::ALL).title("log summary")),
+        panels[2],
+    );
+}
+
+/// Compact age like the plain renderer: 45s / 12m / 3h / 2d.
+fn fmt_age(secs: i64) -> String {
+    if secs >= 86_400 {
+        format!("{}d", secs / 86_400)
+    } else if secs >= 3_600 {
+        format!("{}h", secs / 3_600)
+    } else if secs >= 60 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+fn pod_cpu(p: &crate::kube::PodSummary) -> String {
+    let used = p.cpu_used_milli.map(crate::kube::format_cpu).unwrap_or_else(|| "·".into());
+    let limit = p.cpu_limit_milli.map(crate::kube::format_cpu).unwrap_or_else(|| "·".into());
+    format!("{used}/{limit}")
+}
+
+fn pod_mem(p: &crate::kube::PodSummary) -> String {
+    let used = p.mem_used_bytes.map(crate::view::fmt_bytes).unwrap_or_else(|| "·".into());
+    let limit = p.mem_limit_bytes.map(crate::view::fmt_bytes).unwrap_or_else(|| "·".into());
+    format!("{used}/{limit}")
+}
+
+/// Lines for the log-stats panel, from the aggregated stats.
+fn log_stats_lines(report: &crate::kube::KubeReport) -> Vec<Line<'static>> {
+    let Some(stats) = &report.log_stats else {
+        return vec![Line::from("no logs scanned (set --kube-log-tail > 0)")];
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    if !stats.by_level.is_empty() {
+        let levels: Vec<String> = stats.by_level.iter().map(|(l, c)| format!("{l} {c}")).collect();
+        lines.push(Line::from(format!("levels: {}", levels.join("  "))));
+    }
+    if let (Some(first), Some(last)) = (stats.rss_first_mb, stats.rss_last_mb) {
+        let arrow = if last > first { "↑" } else if last < first { "↓" } else { "→" };
+        let style = if last > first {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(format!("rss: {first} MB {arrow} {last} MB"), style)));
+    }
+    if let Some(rps) = stats.last_throughput_rps {
+        lines.push(Line::from(format!("throughput: {rps} rps")));
+    }
+    for (label, count) in &stats.operational {
+        lines.push(Line::from(format!("{label}: {count}")));
+    }
+    for (msg, count) in stats.top_messages.iter().take(4) {
+        lines.push(Line::from(format!("{count}× {msg}")));
+    }
+    lines
+}
+
+/// Pod-detail view: resource breakdown, this pod's log stats, and its raw logs.
+fn draw_pod_detail(f: &mut ratatui::Frame, area: Rect, state: &ViewState, frame: &Frame) {
+    let Some(report) = &frame.kube else { return };
+    let Some(name) = &state.selected_pod else { return };
+    let pod = report.pods.iter().find(|p| &p.name == name);
+    let logs = report.pod_logs.iter().find(|l| &l.pod == name);
+
+    let halves = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(8), Constraint::Min(4)])
+        .split(area);
+
+    // Top: pod facts.
+    let mut info: Vec<Line> = Vec::new();
+    if let Some(p) = pod {
+        info.push(Line::from(format!("pod:   {}", p.name)));
+        info.push(Line::from(format!("node:  {}", p.node.as_deref().unwrap_or("—"))));
+        info.push(Line::from(format!("ready: {}/{}   restarts: {}", p.ready, p.total_containers, p.restarts)));
+        info.push(Line::from(format!("cpu:   {}", pod_cpu(p))));
+        info.push(Line::from(format!("mem:   {}", pod_mem(p))));
+        if p.oom_killed {
+            info.push(Line::from(Span::styled("OOMKilled", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))));
+        }
+    }
+    f.render_widget(
+        Paragraph::new(info).block(Block::default().borders(Borders::ALL).title(format!("pod · {}", short_topic(name)))),
+        halves[0],
+    );
+
+    // Bottom: raw logs, scrolled to the cursor.
+    let log_lines: Vec<Line> = logs
+        .map(|l| l.lines.iter().map(|s| Line::from(s.clone())).collect())
+        .unwrap_or_else(|| vec![Line::from("no logs captured for this pod")]);
+    f.render_widget(
+        Paragraph::new(log_lines)
+            .block(Block::default().borders(Borders::ALL).title("logs (↑/↓ scroll)"))
+            .scroll((state.cursor as u16, 0)),
+        halves[1],
+    );
+}
+
+/// Node-detail view: node capacity + which pods run on it (node-scoped only).
+fn draw_node_detail(f: &mut ratatui::Frame, area: Rect, state: &ViewState, frame: &Frame) {
+    let Some(report) = &frame.kube else { return };
+    let Some(name) = &state.selected_node else { return };
+    let node = report.nodes.iter().find(|n| &n.name == name);
+
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(n) = node {
+        lines.push(Line::from(format!("node:  {}", n.name)));
+        if let Some(inst) = &n.instance_type {
+            lines.push(Line::from(format!("type:  {inst}")));
+        }
+        let cpu = n.alloc_cpu_milli.map(crate::kube::format_cpu).unwrap_or_else(|| "?".into());
+        let mem = n.alloc_mem_bytes.map(crate::view::fmt_bytes).unwrap_or_else(|| "?".into());
+        lines.push(Line::from(format!("alloc: {cpu} CPU / {mem}")));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("pods on this node:", Style::default().add_modifier(Modifier::BOLD))));
+    for p in report.pods.iter().filter(|p| p.node.as_deref() == Some(name.as_str())) {
+        lines.push(Line::from(format!("  {}   {}   mem {}", p.name, pod_cpu(p), pod_mem(p))));
+    }
+    f.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(format!("node · {}", name))),
         area,
     );
 }
