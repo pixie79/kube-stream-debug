@@ -270,13 +270,12 @@ fn run_tui(
         // Persist the snapshot, same as watch mode — otherwise --json-dir is
         // silently ignored in --tui. Written before any display filtering so the
         // on-disk history is complete.
-        if let Some(dir) = &cli.json_dir {
-            if let Err(err) =
+        if let Some(dir) = &cli.json_dir
+            && let Err(err) =
                 snapshot::write_snapshot(dir, &results, &run_at, cli.json_dir_max_files())
             {
                 eprintln!("Warning: {err}");
             }
-        }
 
         tui::Frame {
             run_at,
