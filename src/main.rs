@@ -17,6 +17,9 @@ mod pulsar;
 mod snapshot;
 mod state;
 mod timestamp;
+#[cfg(feature = "tui")]
+mod tui;
+mod view;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -79,6 +82,11 @@ struct Cli {
     /// from the previous cycle rather than a mid-cycle second sample.
     #[arg(long)]
     watch: bool,
+
+    /// Launch the interactive TUI (view toggle, filter/highlight). Requires a
+    /// binary built with `--features tui`.
+    #[arg(long)]
+    tui: bool,
 
     /// Seconds between watch cycles (only with --watch).
     #[arg(long, default_value_t = 60)]
@@ -160,11 +168,71 @@ fn run() -> anyhow::Result<ExitCode> {
     let topics = parse_topics(&config.topics)?;
     let client = AdminClient::new(&admin_url, &token, Duration::from_secs(cli.timeout_secs));
 
+    if cli.tui {
+        return run_tui(&cli, &client, &topics, &subscription, threshold);
+    }
     if cli.watch {
         watch_loop(&cli, &config.colors, &client, &topics, &subscription, threshold)
     } else {
         single_run(&cli, &config.colors, &client, &topics, &subscription, threshold)
     }
+}
+
+/// Launch the interactive TUI. Feature-gated; without `tui` it prints guidance.
+#[cfg(feature = "tui")]
+fn run_tui(
+    cli: &Cli,
+    client: &AdminClient,
+    topics: &[TopicName],
+    subscription: &str,
+    threshold: i64,
+) -> anyhow::Result<ExitCode> {
+    use std::collections::HashMap;
+
+    // Inter-cycle drain: remember the previous cycle's backlogs, like watch mode.
+    let mut prev: Option<(HashMap<String, i64>, std::time::Instant)> = None;
+    let mut prev_state: HashMap<String, state::PriorState> = HashMap::new();
+
+    let refresh = move || {
+        let now = std::time::Instant::now();
+        let run_at = timestamp::now_rfc3339();
+        let mut results = check_all(client, topics, subscription, threshold, cli.concurrency);
+        if let Some((prev_backlogs, prev_at)) = &prev {
+            let window = now.duration_since(*prev_at).as_secs_f64();
+            apply_interval_drain(&mut results, prev_backlogs, window);
+        }
+        state::assign_state_since(&mut results, &prev_state, &run_at);
+        prev_state = state::prior_from_results(&results);
+        let backlogs: HashMap<String, i64> =
+            results.iter().map(|h| (h.topic.clone(), h.total_backlog)).collect();
+        prev = Some((backlogs, now));
+
+        let kube = fetch_kube_report(cli);
+        if let Some(report) = &kube {
+            annotate_with_kube(&mut results, report);
+        }
+        tui::Frame {
+            run_at,
+            topics: results,
+            kube,
+            subscription: subscription.to_string(),
+        }
+    };
+
+    tui::run(Box::new(refresh), Duration::from_secs(cli.watch_interval_secs.max(1)))?;
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(feature = "tui"))]
+fn run_tui(
+    _cli: &Cli,
+    _client: &AdminClient,
+    _topics: &[TopicName],
+    _subscription: &str,
+    _threshold: i64,
+) -> anyhow::Result<ExitCode> {
+    eprintln!("--tui requires the tool to be built with `--features tui`.");
+    Ok(ExitCode::from(1))
 }
 
 /// One-shot run: check, optionally take a mid-cycle drain sample, render, and

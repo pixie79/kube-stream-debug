@@ -126,6 +126,7 @@ Flags worth knowing:
 | `--kube-configmap <name>` | ConfigMap holding `config.toml` for `--kube-assert` checks. |
 | `--kube-assert key=value` | Assert a `config.toml` value (repeatable). |
 | `--kube-log-tail <n>` | Log lines scanned per pod for signals (default 200; 0 = skip). |
+| `--tui` | Launch the interactive TUI (needs a binary built with `--features tui`). |
 | `--concurrency <n>` | Parallel admin requests (default 8). |
 | `--timeout-secs <n>` | Per-request timeout (default 30). |
 | `--problems-only` | Hide healthy (`OK`) rows. |
@@ -145,6 +146,10 @@ Typical uses to suggest:
 
 - Live monitoring during an incident: `--watch --watch-interval-secs 30`.
 - Building a diffable history: `--watch --json-dir ./snapshots` then compare successive files, or process them with `jq`.
+
+## Interactive TUI (optional, `--tui`)
+
+With a binary built `--features tui`, `--tui` launches a full-screen terminal UI that refreshes live. Four views cycle with `v`: **topic** (the classic table), **partition** (one row per partition flattened across all topics), **kube** (pod summary, populated when also run with `--kube`), and **combined** (topics + partitions split screen). `/` edits a query matching a topic or partition name (`p3` matches `…-partition-3`); `f` toggles Filter (hide non-matching) vs Highlight (emphasise matching) mode; `c` clears, `r` refreshes, `q` quits. Refresh cadence is `--watch-interval-secs`; drain trend comes from consecutive refreshes. Like `--kube`, it's a build feature — without it, `--tui` prints guidance and exits. The features are independent; combine `--features tui,kube` for the kube view to have data.
 
 ## Kubernetes correlation (optional, `--kube`)
 

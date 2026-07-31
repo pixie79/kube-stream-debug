@@ -397,7 +397,7 @@ pub fn render_jsonl(results: &[TopicHealth], run_at: &str) -> serde_json::Result
 
 /// Binary byte sizes matching the Pulsar dashboard's units (GiB/MiB/KiB).
 /// Zero renders as "—" so unpopulated sizes don't read as a real 0 B.
-fn format_bytes(bytes: i64) -> String {
+pub(crate) fn format_bytes(bytes: i64) -> String {
     if bytes <= 0 {
         return "—".to_string();
     }
@@ -446,6 +446,7 @@ mod tests {
             at_edge_partitions: Vec::new(),
             hot_partitions: Vec::new(),
             partition_gaps: Vec::new(),
+            partitions: Vec::new(),
             drain: None,
             state_since: None,
             kube_hint: None,
@@ -476,6 +477,7 @@ mod tests {
             at_edge_partitions: Vec::new(),
             hot_partitions: Vec::new(),
             partition_gaps: Vec::new(),
+            partitions: Vec::new(),
             drain: None,
             state_since: None,
             kube_hint: None,

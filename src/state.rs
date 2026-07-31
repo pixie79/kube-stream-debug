@@ -208,6 +208,7 @@ mod tests {
             at_edge_partitions: Vec::new(),
             hot_partitions: Vec::new(),
             partition_gaps: Vec::new(),
+            partitions: Vec::new(),
             drain: trend.map(|t| DrainStats {
                 trend: t,
                 delta: 0,

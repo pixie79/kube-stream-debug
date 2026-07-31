@@ -77,6 +77,24 @@ pub struct AtEdgePartition {
     pub headroom: Option<i64>,
 }
 
+/// Per-partition status for the partition-level view. Distinct from the
+/// summary detail structs (hot/gap/edge) — this is the *complete* row set,
+/// one entry per partition, whatever its state.
+#[derive(Debug, Clone, Serialize)]
+pub struct PartitionDetail {
+    /// Full partition topic name (…-partition-N).
+    pub partition: String,
+    /// Numeric partition index for stable sorting/selection.
+    pub index: u32,
+    pub backlog: i64,
+    pub backlog_bytes: i64,
+    pub consumers: usize,
+    pub unacked_messages: i64,
+    /// Per-partition status label: "ok" | "hot" | "no_consumers" |
+    /// "subscription_missing" | "trimmed" | "at_edge".
+    pub status: &'static str,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TopicHealth {
     pub topic: String,
@@ -99,6 +117,10 @@ pub struct TopicHealth {
     pub hot_partitions: Vec<HotPartition>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub partition_gaps: Vec<PartitionGap>,
+    /// Complete per-partition rows for the partition-level view (empty for
+    /// non-partitioned topics or when partition stats were unavailable).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub partitions: Vec<PartitionDetail>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub drain: Option<DrainStats>,
     /// UTC RFC3339 timestamp at which this topic's current (status, trend) was
@@ -130,6 +152,7 @@ impl TopicHealth {
             at_edge_partitions: Vec::new(),
             hot_partitions: Vec::new(),
             partition_gaps: Vec::new(),
+            partitions: Vec::new(),
             drain: None,
             state_since: None,
             kube_hint: None,
@@ -234,6 +257,7 @@ fn evaluate(
         at_edge_partitions: Vec::new(),
         hot_partitions: Vec::new(),
         partition_gaps: Vec::new(),
+        partitions: Vec::new(),
         drain: None,
         state_since: None,
             kube_hint: None,
@@ -267,21 +291,38 @@ fn evaluate(
             .sum();
         health.consumers = health.consumers.max(partition_consumer_sum);
 
-        // Per-partition cursor trim check: read each partition's backlog from
-        // the stats we already have, then judge it against its ledger floor.
+        // Per-partition detail + cursor trim check: read each partition's
+        // backlog from the stats we already have, judge it against its ledger
+        // floor, and record a complete row for the partition-level view.
         let mut names: Vec<&String> = stats.partitions.keys().collect();
         names.sort_by_key(|name| partition_index(name));
         for name in names {
-            let backlog = stats
+            let sub = stats
                 .partitions
                 .get(name)
-                .and_then(|p| p.subscriptions.get(subscription))
-                .map(|s| s.msg_backlog)
-                .unwrap_or(0);
+                .and_then(|p| p.subscriptions.get(subscription));
+            let backlog = sub.map(|s| s.msg_backlog).unwrap_or(0);
+            let backlog_bytes = sub.map(|s| s.backlog_size).unwrap_or(0);
+            let consumers = sub.map(|s| s.consumers.len()).unwrap_or(0);
+            let unacked = sub.map(|s| s.unacked_total()).unwrap_or(0);
+
+            let mut cursor_status = None;
             if let Some(is) = internal.get(name) {
                 let status = evaluate_cursor(is, subscription, backlog);
+                cursor_status = Some(status.verdict);
                 record_cursor(&mut health, name, &status);
             }
+
+            let status = partition_status(sub.is_some(), consumers, backlog, threshold, cursor_status);
+            health.partitions.push(PartitionDetail {
+                partition: name.clone(),
+                index: partition_index(name),
+                backlog,
+                backlog_bytes,
+                consumers,
+                unacked_messages: unacked,
+                status,
+            });
         }
     } else {
         if health.total_backlog > threshold {
@@ -377,6 +418,33 @@ fn classify(health: &TopicHealth) -> Status {
 }
 
 /// Extract the numeric suffix of `…-partition-N` for stable sort order.
+/// Classify a single partition's status, worst-first, mirroring the topic-level
+/// priority: trimmed > missing subscription > no consumers > hot > ok.
+fn partition_status(
+    sub_present: bool,
+    consumers: usize,
+    backlog: i64,
+    threshold: i64,
+    cursor: Option<TrimVerdict>,
+) -> &'static str {
+    if matches!(cursor, Some(TrimVerdict::Stuck)) {
+        return "trimmed";
+    }
+    if !sub_present {
+        return "subscription_missing";
+    }
+    if consumers == 0 {
+        return "no_consumers";
+    }
+    if matches!(cursor, Some(TrimVerdict::AtEdge)) {
+        return "at_edge";
+    }
+    if backlog > threshold {
+        return "hot";
+    }
+    "ok"
+}
+
 fn partition_index(name: &str) -> u32 {
     name.rsplit("-partition-")
         .next()

@@ -46,6 +46,30 @@ unacked_crit = 200000
 
 Colours render in a terminal and are automatically stripped when output is piped or redirected, so captured runs stay plain-text for diffing.
 
+## Interactive TUI (optional)
+
+With the `tui` feature the tool offers a full-screen interactive terminal UI that refreshes live and lets you switch views and select partitions from the keyboard — handy when a topic-level symptom needs drilling into at the partition level, or when correlating against pods.
+
+```sh
+cargo build --release --features tui
+pulsar-topic-health --tui
+```
+
+Four views, cycled with `v`:
+
+- **topic** — the classic per-topic table.
+- **partition** — one row per partition, flattened across all topics, so you can scan every partition's backlog/consumers/status at once.
+- **kube** — the Kubernetes pod-summary section (populated when also built and run with `--kube`).
+- **combined** — a split screen: topics on top, partitions below.
+
+Selecting and filtering:
+
+- `/` edits a query that matches a topic or partition name (`p3` matches `…-partition-3`); Enter applies, Esc cancels.
+- `f` toggles between **Highlight** mode (keep all rows, emphasise matches) and **Filter** mode (hide non-matching rows).
+- `c` clears the query, `r` refreshes now, `q` (or Ctrl-C) quits.
+
+The refresh cadence uses `--watch-interval-secs`, and drain trend is derived from consecutive refreshes just like `--watch`. The `tui` and `kube` features are independent — combine them (`--features tui,kube`) for the kube view to have data.
+
 ## Kubernetes correlation (optional)
 
 The subscription's consumers usually run in Kubernetes pods, and a broker-side symptom — `NO_CONSUMERS`, a growing backlog — is often caused by a pod-side fault: an OOMKill, a crash-loop, a pod stuck mid-ramp, or a bad config rollout. With the `kube` feature the tool can fetch that consumer-side health and show it alongside the topic table, so "backlog is growing" becomes "backlog is growing *because* two pods OOM-killed 4 minutes ago".
