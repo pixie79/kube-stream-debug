@@ -12,10 +12,9 @@ use crate::health::TopicHealth;
 /// Which panel the user is looking at. Cycled with a keypress.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
-    /// One row per topic (the classic table).
+    /// One row per topic (the classic table). Enter drills into a topic's
+    /// partitions via the combined view.
     Topic,
-    /// One row per partition, flattened across all topics.
-    Partition,
     /// Kubernetes consumer-pod health.
     Kube,
     /// Split: topics on top, partitions (of the selected topic) below.
@@ -34,8 +33,7 @@ impl View {
     /// reached by drilling in, and cycling from them returns to the topic view.
     pub fn next(self) -> View {
         match self {
-            View::Topic => View::Partition,
-            View::Partition => View::Kube,
+            View::Topic => View::Kube,
             View::Kube => View::Combined,
             View::Combined => View::Topic,
             View::PodDetail | View::NodeDetail => View::Topic,
@@ -45,7 +43,6 @@ impl View {
     pub fn label(self) -> &'static str {
         match self {
             View::Topic => "topic",
-            View::Partition => "partition",
             View::Kube => "kube",
             View::Combined => "combined",
             View::PodDetail => "pod",
@@ -435,10 +432,8 @@ mod tests {
     }
 
     #[test]
-    fn view_cycles_through_four() {
+    fn view_cycles_through_three() {
         let mut v = View::Topic;
-        v = v.next();
-        assert_eq!(v, View::Partition);
         v = v.next();
         assert_eq!(v, View::Kube);
         v = v.next();
@@ -599,7 +594,7 @@ mod tests {
     fn cycle_view_resets_cursor() {
         let mut state = ViewState { cursor: 4, ..Default::default() };
         state.cycle_view();
-        assert_eq!(state.view, View::Partition);
+        assert_eq!(state.view, View::Kube);
         assert_eq!(state.cursor, 0);
     }
 

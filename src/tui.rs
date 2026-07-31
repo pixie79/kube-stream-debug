@@ -40,8 +40,11 @@ pub struct Frame {
 }
 
 /// A callback that fetches a fresh `Frame` (runs the Pulsar + optional kube
-/// checks). Kept as a closure so the TUI doesn't depend on main's wiring.
-pub type Refresh<'a> = dyn FnMut() -> Frame + 'a;
+/// checks). Kept as a closure so the TUI doesn't depend on main's wiring. Must
+/// be `Send`: the refresh runs on a background worker thread so it never blocks
+/// the UI. Its captures (the admin client, topic list, kube config) are all
+/// `Send`, so callers satisfy this naturally.
+pub type Refresh<'a> = dyn FnMut() -> Frame + Send + 'a;
 
 /// Run the interactive TUI until the user quits. `interval` is the auto-refresh
 /// cadence.
