@@ -133,6 +133,20 @@ Flags worth knowing:
 
 When drain measurement is on, the command takes at least `--drain-window-secs` longer to return — it deliberately sleeps between samples. If the user needs an instant read, tell them to pass `--drain-window-secs 0`.
 
+**Every flag in that table can also live in the config** under a `[settings]` section, so a frequently-run configuration doesn't need a long command line. Each field is optional and a CLI flag always overrides the config value; the mode switches (`watch`, `tui`, `problems_only`) can be turned on by the flag or config but not forced off. So `pulsar-topic-health -c prod.toml --watch --tui --json-dir ./snapshots --kube` collapses to `pulsar-topic-health -c prod.toml` with those in `[settings]` and `enabled = true` in `[kube]`:
+
+```toml
+[settings]
+format = "table"        # or "jsonl"
+watch = true
+tui = true
+json_dir = "./snapshots"
+# concurrency, timeout_secs, drain_window_secs, watch_interval_secs,
+# json_dir_max_files, problems_only all settable too
+```
+
+A typoed key in `[settings]` is a hard error, like the rest of the config.
+
 ## Watch mode and JSON snapshots
 
 `--watch` runs continuously, clearing and redrawing the table every `--watch-interval-secs` (default 60) until the user interrupts it (ctrl-c). Two things differ from a single run:
@@ -149,7 +163,15 @@ Typical uses to suggest:
 
 ## Interactive TUI (optional, `--tui`)
 
-The interactive TUI (`--tui`, built in by default) is a full-screen terminal UI that refreshes live. Four views cycle with `v`: **topic** (the classic table), **partition** (one row per partition flattened across all topics), **kube** (pod summary, populated when also run with `--kube`), and **combined** (topics on top, the drilled-into topic's partitions below). Navigate with **↑/↓** (or `k`/`j`) to move the cursor between topics; **Enter** drills into the selected topic (combined view scoped to its partitions); **Esc** backs out; **r** refreshes, **q** quits. Refresh cadence is `--watch-interval-secs`; drain trend comes from consecutive refreshes. The kube view has data only when the binary is built `--features kube` and run with `--kube`.
+The interactive TUI (`--tui`, built in by default) is a full-screen terminal UI that refreshes live. **Three views** cycle with `v`: **topic** (the classic table, with TREND/ETA columns once drain data exists), **kube** (pod-and-node health, populated when also run with `--kube`), and **combined** (topics on top, the drilled-into topic's partitions below).
+
+Navigation and drill-in:
+- **↑/↓** (or `k`/`j`) move the cursor; **Enter** on a topic drills into it (combined view scoped to its partitions); **Esc** backs out. There is no standalone partition view — drill into the topic you care about instead.
+- In the **kube** view, **Tab** switches the cursor between the pods and nodes sections; **Enter** opens detail for the selected pod (resource breakdown + its logs) or node (capacity + which pods run on it).
+- In **pod-detail**, the logs are a scannable one-line-per-entry list: **↑/↓** select a line, **Enter** expands it to a pretty-printed view (timestamp, level, message, error, fields) so the full untruncated error is readable, **Esc** collapses, **w** toggles wrapping.
+- **?** toggles a legend overlay; **r** refreshes now; **q** quits.
+
+Refresh runs on a **background thread**, so switching views is instant and the fetch never freezes the UI — the screen always shows the most recent data and updates in place when the next refresh lands. Cadence is `--watch-interval-secs`; drain trend comes from consecutive refreshes. The kube view has data only when the binary is built `--features kube` and run with `--kube`.
 
 ## Kubernetes correlation (optional, `--kube`)
 
@@ -184,12 +206,20 @@ assert    = { worker_count = "24", batch_size = "30" }
 ```
 
 What it shows:
-- A **pod-summary section** above the topic table: pod name, ready count, restarts, age, and state (with `OOMKilled` / `CrashLoopBackOff` highlighted).
-- **Rollout flags**: a split rollout (more than one image across pods) or large rollout skew (pods not restarted together — a rollout may be incomplete or a pod is stale).
+- A **pod-and-node section** above the topic table: pod name, ready count, restarts, age, CPU/MEM (used/limit, coloured by percent when metrics-server is present), and state. Node capacity and instance type are shown too.
+- **Escalated log signals** — the incident story, not just raw numbers. Each shows a red pod state + a prominent banner + a tally:
+  - `DLQ-ERROR` — a transform / data-quality / DLQ error (DataFusion or SQL parse error, rows captured to a dead-letter queue). Means *silent data loss*: rows dropped to the DLQ while the pipeline looks healthy. Wins the state cell even over OOM.
+  - `MEM-CRITICAL` — a **pre-OOM** memory warning (RSS crossing the cgroup limit, "OOM kill imminent"), caught *before* the kernel kills the pod. Ranks above `OOMKilled` (which already happened) because it's still savable.
+  - **Throughput collapse** — a pod that was processing and dropped to zero (distinct from one idle since start).
+  - **Reconnect storm** — a burst of broker-closed/disconnect/TLS-EOF events, distinct from incidental churn.
+  - **Backpressure** — an internal channel near-full, which precedes a stall.
+- **Rollout flags**: a split rollout (more than one image across pods) or large rollout skew (pods not restarted together).
 - **Events**: recent OOMKilling / Evicted / Failed events in the namespace.
 - **Config assertions**: any failed `--kube-assert` printed as `✗ config <key>: expected X, got Y`.
-- **Log signals**: matches for ramp / OOM / error / config patterns in each pod's recent logs.
+- **Log-stats summary**: level counts, RSS trend (red when climbing), throughput, operational tallies, and top messages.
 - **Correlation hint in DETAIL**: unhealthy topics gain a short pod-side cause, e.g. `kube: 2 pod(s) OOM-killed`.
+
+**When no pods match**, the tool helps rather than printing a dead "no pods matched": if the namespace doesn't exist it lists the available namespaces; if the selector missed it lists the label keys and values on the namespace's pods and suggests a ready-to-paste selector. In a one-shot run it prints these and exits code 3; in `--watch`/`--tui` it shows them in the kube panel and keeps running.
 
 In JSONL mode the full kube report is emitted as one extra line before the topic lines.
 
@@ -248,6 +278,7 @@ Compact, worst-first: `TRIMMED: pN` (a `!` marks broker-corroborated stuck), the
 - **A topic shows huge `BACKLOG` but green `HEADROOM` in the millions.** Behind, not in danger. Catchable if the trend cooperates. Contrast with a huge backlog and red/zero headroom, which is genuine data loss.
 - **`TRIMMED` appears.** Stop and flag it clearly. The consumer is reading deleted ledgers; no amount of waiting helps. Remediation is a `pulsar-admin topics reset-cursor` (to earliest or a timestamp) — a deliberate, irreversible human action that this read-only tool intentionally does not perform. Do not run it on the user's behalf without explicit confirmation.
 - **The tool disagrees with a Grafana panel.** Usually a window mismatch: the CLI is an instantaneous snapshot, the dashboard is a time range. A flat, high line on the dashboard is a `stable` standing backlog, which is consistent with the CLI screaming `BACKLOG`. If the dashboard's per-partition *byte* sizes differ from the CLI, confirm the CLI is on a version that fetches `SIZE` (backlog bytes); older builds only had message counts.
+- **A `--kube` run shows `DLQ-ERROR` or `MEM-CRITICAL` (or a collapse/storm/backpressure banner).** These are the highest-priority findings and often explain a topic symptom. `DLQ-ERROR` means rows are being silently dropped to a dead-letter queue — a topic can look like it's draining while data is quietly lost downstream; surface it prominently and point at the failing transform in the pod logs (the pod-detail view expands the full error). `MEM-CRITICAL` is a *pre-OOM* warning — act before the pod dies, unlike `OOMKilled` where it's already happened. A throughput collapse (`was processing, now 0`) plus a growing topic is a stalled-consumer story, distinct from a never-started one. When one of these banners is present, lead with it, not with the topic table.
 
 ## Cost and load notes
 
