@@ -126,7 +126,7 @@ Flags worth knowing:
 | `--kube-configmap <name>` | ConfigMap holding `config.toml` for `--kube-assert` checks. |
 | `--kube-assert key=value` | Assert a `config.toml` value (repeatable). |
 | `--kube-log-tail <n>` | Log lines scanned per pod for signals (default 200; 0 = skip). |
-| `--tui` | Launch the interactive TUI (needs a binary built with `--features tui`). |
+| `--tui` | Launch the interactive TUI (built in by default). |
 | `--concurrency <n>` | Parallel admin requests (default 8). |
 | `--timeout-secs <n>` | Per-request timeout (default 30). |
 | `--problems-only` | Hide healthy (`OK`) rows. |
@@ -149,7 +149,7 @@ Typical uses to suggest:
 
 ## Interactive TUI (optional, `--tui`)
 
-With a binary built `--features tui`, `--tui` launches a full-screen terminal UI that refreshes live. Four views cycle with `v`: **topic** (the classic table), **partition** (one row per partition flattened across all topics), **kube** (pod summary, populated when also run with `--kube`), and **combined** (topics on top, the drilled-into topic's partitions below). Navigate with **↑/↓** (or `k`/`j`) to move the cursor between topics; **Enter** drills into the selected topic (combined view scoped to its partitions); **Esc** backs out; **r** refreshes, **q** quits. Refresh cadence is `--watch-interval-secs`; drain trend comes from consecutive refreshes. Like `--kube`, it's a build feature — without it, `--tui` prints guidance and exits. The features are independent; combine `--features tui,kube` for the kube view to have data.
+The interactive TUI (`--tui`, built in by default) is a full-screen terminal UI that refreshes live. Four views cycle with `v`: **topic** (the classic table), **partition** (one row per partition flattened across all topics), **kube** (pod summary, populated when also run with `--kube`), and **combined** (topics on top, the drilled-into topic's partitions below). Navigate with **↑/↓** (or `k`/`j`) to move the cursor between topics; **Enter** drills into the selected topic (combined view scoped to its partitions); **Esc** backs out; **r** refreshes, **q** quits. Refresh cadence is `--watch-interval-secs`; drain trend comes from consecutive refreshes. The kube view has data only when the binary is built `--features kube` and run with `--kube`.
 
 ## Kubernetes correlation (optional, `--kube`)
 

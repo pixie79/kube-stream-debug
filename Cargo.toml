@@ -16,22 +16,20 @@ thiserror = "1"
 toml = "0.8"
 ureq = { version = "2.10", features = ["json"] }
 
-# Optional Kubernetes correlation. Off by default so the core tool stays a
-# small, sync binary; enable with `--features kube` to pull in kube-rs + tokio.
+# Interactive TUI, always compiled in. The event loop lives in src/tui.rs;
+# the pure view-state logic in src/view.rs is unit-tested.
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Optional Kubernetes correlation. Off by default so the base tool doesn't
+# require kube-rs + tokio; enable with `--features kube`.
 kube = { version = "0.99", default-features = false, features = ["client", "rustls-tls", "config"], optional = true }
 k8s-openapi = { version = "0.24", features = ["latest"], optional = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"], optional = true }
 
-# Optional interactive TUI (ratatui + crossterm). Off by default; enable with
-# `--features tui`. Pure view-state logic (src/view.rs) is always compiled and
-# tested; only the terminal event loop is gated.
-ratatui = { version = "0.29", optional = true }
-crossterm = { version = "0.28", optional = true }
-
 [features]
 default = []
 kube = ["dep:kube", "dep:k8s-openapi", "dep:tokio"]
-tui = ["dep:ratatui", "dep:crossterm"]
 
 [profile.release]
 lto = "thin"

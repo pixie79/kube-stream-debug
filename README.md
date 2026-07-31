@@ -46,12 +46,11 @@ unacked_crit = 200000
 
 Colours render in a terminal and are automatically stripped when output is piped or redirected, so captured runs stay plain-text for diffing.
 
-## Interactive TUI (optional)
+## Interactive TUI
 
-With the `tui` feature the tool offers a full-screen interactive terminal UI that refreshes live and lets you switch views and select partitions from the keyboard — handy when a topic-level symptom needs drilling into at the partition level, or when correlating against pods.
+The tool includes a full-screen interactive terminal UI that refreshes live and lets you switch views and drill into a topic's partitions from the keyboard — handy when a topic-level symptom needs drilling into at the partition level, or when correlating against pods. It's built in by default:
 
 ```sh
-cargo build --release --features tui
 pulsar-topic-health --tui
 ```
 
@@ -69,7 +68,7 @@ Navigating and drilling in:
 - **Esc** backs out of the drill-in to the topic view.
 - **r** refreshes now, **q** (or Ctrl-C) quits.
 
-The refresh cadence uses `--watch-interval-secs`, and drain trend is derived from consecutive refreshes just like `--watch`. The `tui` and `kube` features are independent — combine them (`--features tui,kube`) for the kube view to have data.
+The refresh cadence uses `--watch-interval-secs`, and drain trend is derived from consecutive refreshes just like `--watch`. The kube view has data when the binary is also built with `--features kube` and run with `--kube`.
 
 ## Kubernetes correlation (optional)
 

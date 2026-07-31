@@ -6,10 +6,6 @@
 //! mutates a `ViewState` on keypresses and asks this module for the rows to
 //! draw. Keeping the decision logic here means it's fully unit-tested even
 //! though the terminal loop can't be.
-//!
-//! The logic is consumed by the feature-gated `tui` module; without that
-//! feature the binary doesn't call it, so suppress dead-code warnings there.
-#![cfg_attr(not(feature = "tui"), allow(dead_code))]
 
 use crate::health::TopicHealth;
 

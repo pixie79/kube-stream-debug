@@ -1,15 +1,7 @@
-//! Interactive terminal UI (ratatui + crossterm). Compiled only with the `tui`
-//! feature.
+//! Interactive terminal UI (ratatui + crossterm), compiled into every build.
 //!
-//! ## Compilation note
-//!
-//! This module was written against ratatui 0.29 / crossterm 0.28 but could not
-//! be compiled in the environment where it was authored. The pure view-state
-//! and selection logic it drives (in `crate::view`) is fully unit-tested; this
-//! file is the terminal shell around it. If the first `--features tui` build
-//! fails, likely spots: the `ratatui::init()` / `restore()` helpers (0.28+),
-//! `Table`/`Row`/`Cell` construction, and the crossterm `event::read` enum
-//! shapes. These are mechanical to fix and don't affect the tested logic.
+//! The pure view-state and selection logic it drives (in `crate::view`) is
+//! unit-tested; this file is the terminal shell around it.
 //!
 //! Keybindings:
 //!   ↑/↓ (or k/j)  move the cursor between topics

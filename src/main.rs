@@ -17,7 +17,6 @@ mod pulsar;
 mod snapshot;
 mod state;
 mod timestamp;
-#[cfg(feature = "tui")]
 mod tui;
 mod view;
 
@@ -83,8 +82,7 @@ struct Cli {
     #[arg(long)]
     watch: bool,
 
-    /// Launch the interactive TUI (view toggle, filter/highlight). Requires a
-    /// binary built with `--features tui`.
+    /// Launch the interactive TUI (view toggle, cursor navigation, drill-in).
     #[arg(long)]
     tui: bool,
 
@@ -185,8 +183,7 @@ fn run() -> anyhow::Result<ExitCode> {
     }
 }
 
-/// Launch the interactive TUI. Feature-gated; without `tui` it prints guidance.
-#[cfg(feature = "tui")]
+/// Launch the interactive TUI.
 fn run_tui(
     cli: &Cli,
     kube_config: &config::KubeConfig,
@@ -229,19 +226,6 @@ fn run_tui(
 
     tui::run(Box::new(refresh), Duration::from_secs(cli.watch_interval_secs.max(1)))?;
     Ok(ExitCode::SUCCESS)
-}
-
-#[cfg(not(feature = "tui"))]
-fn run_tui(
-    _cli: &Cli,
-    _kube_config: &config::KubeConfig,
-    _client: &AdminClient,
-    _topics: &[TopicName],
-    _subscription: &str,
-    _threshold: i64,
-) -> anyhow::Result<ExitCode> {
-    eprintln!("--tui requires the tool to be built with `--features tui`.");
-    Ok(ExitCode::from(1))
 }
 
 /// One-shot run: check, optionally take a mid-cycle drain sample, render, and
