@@ -10,7 +10,7 @@
 //!   Enter         drill in: a topic → combined; a pod → pod-detail (logs +
 //!                 stats); a node → node-detail (capacity + its pods)
 //!   Esc           back out of any drill-in
-//!   v             cycle view (topic → partition → kube → combined)
+//!   v             cycle view (topic → kube → combined)
 //!   ?             toggle the status-legend help overlay
 //!   r             refresh now
 //!   q / Ctrl-C    quit
@@ -25,7 +25,7 @@ use ratatui::DefaultTerminal;
 use crate::health::TopicHealth;
 use crate::kube::KubeReport;
 use crate::view::{
-    partition_rows, partition_rows_for_topic, partition_status_legend, status_legend,
+    partition_rows_for_topic, partition_status_legend, status_legend,
     status_severity, trend_legend,
     PartitionRow, Severity, View, ViewState,
 };
@@ -52,22 +52,67 @@ pub fn run(mut refresh: Box<Refresh<'_>>, interval: Duration) -> std::io::Result
     result
 }
 
+/// Message from the UI thread to the refresh worker.
+enum RefreshCmd {
+    Now,
+    Stop,
+}
+
 fn event_loop(
     terminal: &mut DefaultTerminal,
     refresh: &mut Refresh<'_>,
     interval: Duration,
 ) -> std::io::Result<()> {
+    use std::sync::mpsc;
+
     let mut state = ViewState::default();
     let mut frame = refresh();
-    let mut last_refresh = Instant::now();
 
+    // Refresh runs on a background thread so the slow fetch (Pulsar admin +
+    // Kubernetes API) never blocks input or view switching. A scoped thread lets
+    // the worker borrow the same non-'static refresh closure the UI uses.
+    let (frame_tx, frame_rx) = mpsc::channel::<Frame>();
+    let (cmd_tx, cmd_rx) = mpsc::channel::<RefreshCmd>();
+
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let mut last = Instant::now();
+            loop {
+                let wait = interval.saturating_sub(last.elapsed());
+                match cmd_rx.recv_timeout(wait) {
+                    Ok(RefreshCmd::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Ok(RefreshCmd::Now) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+                let f = refresh();
+                last = Instant::now();
+                if frame_tx.send(f).is_err() {
+                    break;
+                }
+            }
+        });
+        let ui_result = ui_loop(terminal, &mut state, &mut frame, &frame_rx, &cmd_tx);
+        let _ = cmd_tx.send(RefreshCmd::Stop);
+        ui_result
+    })
+}
+
+/// The interactive UI loop: instant view switches, non-blocking frame updates.
+fn ui_loop(
+    terminal: &mut DefaultTerminal,
+    state: &mut ViewState,
+    frame: &mut Frame,
+    frame_rx: &std::sync::mpsc::Receiver<Frame>,
+    cmd_tx: &std::sync::mpsc::Sender<RefreshCmd>,
+) -> std::io::Result<()> {
     loop {
-        terminal.draw(|f| draw(f, &state, &frame))?;
+        while let Ok(f) = frame_rx.try_recv() {
+            *frame = f;
+            state.clamp_cursor(frame.topics.len());
+        }
 
-        // Wait for input up to the remaining interval; refresh when it elapses.
-        let elapsed = last_refresh.elapsed();
-        let wait = interval.saturating_sub(elapsed);
-        if event::poll(wait)?
+        terminal.draw(|f| draw(f, state, frame))?;
+
+        if event::poll(Duration::from_millis(100))?
             && let Event::Key(key) = event::read()? {
                 // Names in render order, for cursor bounds and drill resolution.
                 let pod_names: Vec<String> =
@@ -136,19 +181,13 @@ fn event_loop(
                         }
                     }
                     KeyCode::Char('r') => {
-                        frame = refresh();
-                        state.clamp_cursor(frame.topics.len());
-                        last_refresh = Instant::now();
+                        // Ask the worker to refresh; the frame arrives via the
+                        // channel and folds in at the top of the loop.
+                        let _ = cmd_tx.send(RefreshCmd::Now);
                     }
                     _ => {}
                 }
             }
-
-        if last_refresh.elapsed() >= interval {
-            frame = refresh();
-            state.clamp_cursor(frame.topics.len());
-            last_refresh = Instant::now();
-        }
     }
     Ok(())
 }
@@ -179,7 +218,6 @@ fn draw(f: &mut ratatui::Frame, state: &ViewState, frame: &Frame) {
 
     match state.view {
         View::Topic => draw_topics(f, chunks[1], state, frame),
-        View::Partition => draw_partitions(f, chunks[1], state, frame),
         View::Kube => draw_kube(f, chunks[1], state, frame),
         View::Combined => draw_combined(f, chunks[1], state, frame),
         View::PodDetail => draw_pod_detail(f, chunks[1], state, frame),
@@ -410,11 +448,6 @@ fn draw_partition_rows(
         .header(header)
         .block(Block::default().borders(Borders::ALL).title(title.to_string()));
     f.render_widget(table, area);
-}
-
-fn draw_partitions(f: &mut ratatui::Frame, area: Rect, state: &ViewState, frame: &Frame) {
-    let all = partition_rows(&frame.topics);
-    draw_partition_rows(f, area, &all, Some(state.cursor), "partitions");
 }
 
 fn draw_kube(f: &mut ratatui::Frame, area: Rect, state: &ViewState, frame: &Frame) {
