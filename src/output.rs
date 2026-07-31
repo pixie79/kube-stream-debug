@@ -201,14 +201,11 @@ pub fn render_kube_section(report: &crate::kube::KubeReport) -> String {
         .collect();
     let dlq_count = report.log_stats.as_ref().map(|s| s.transform_errors).unwrap_or(0);
     if !dlq_pods.is_empty() || dlq_count > 0 {
-        let banner = Cell::new(format!(
-            " ⚠ TRANSFORM/DLQ ERRORS: {} log line(s) — rows are being dropped to the DLQ (silent data loss) ",
+        let _ = writeln!(
+            out,
+            "  ⚠ TRANSFORM/DLQ ERRORS: {} log line(s) — rows are being dropped to the DLQ (SILENT DATA LOSS)",
             dlq_count.max(dlq_pods.len())
-        ))
-        .fg(Color::White)
-        .bg(Color::Red)
-        .add_attribute(Attribute::Bold);
-        let _ = writeln!(out, "  {banner}");
+        );
         if !dlq_pods.is_empty() {
             let _ = writeln!(out, "    affected pods: {}", dlq_pods.join(", "));
         }
@@ -273,10 +270,7 @@ pub fn render_kube_section(report: &crate::kube::KubeReport) -> String {
     if let Some(stats) = &report.log_stats {
         let _ = writeln!(out, "  log summary ({} lines):", stats.total);
         if stats.transform_errors > 0 {
-            let cell = Cell::new(format!("transform/DLQ errors: {}", stats.transform_errors))
-                .fg(Color::Red)
-                .add_attribute(Attribute::Bold);
-            let _ = writeln!(out, "    {cell}");
+            let _ = writeln!(out, "    ⚠ transform/DLQ errors: {}", stats.transform_errors);
         }
         if !stats.by_level.is_empty() {
             let levels: Vec<String> = stats
