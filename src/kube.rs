@@ -520,6 +520,86 @@ pub fn scan_log_signals(pod: &str, log_text: &str) -> Vec<LogSignal> {
 /// Message normalisation strips the volatile bits (UUIDs, consumer ids, topic
 /// partitions, numbers) so "closed consumer 27 …partition-1" and "closed
 /// consumer 36 …partition-3" collapse into one ranked entry.
+/// A compact one-line summary of an OTEL JSON log line for the scannable list:
+/// `LEVEL  message` (message truncated). Falls back to the raw line when it
+/// isn't JSON. Pure and testable.
+pub fn log_line_summary(line: &str, max_len: usize) -> String {
+    let (level, message) = match serde_json::from_str::<serde_json::Value>(line) {
+        Ok(v) => {
+            let level = v.get("level").and_then(|l| l.as_str()).unwrap_or("").to_string();
+            let msg = v
+                .get("fields")
+                .and_then(|f| f.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string();
+            (level, msg)
+        }
+        Err(_) => return truncate_str(line, max_len),
+    };
+    let mut s = if level.is_empty() {
+        message
+    } else {
+        format!("{level:<5} {message}")
+    };
+    s = truncate_str(&s, max_len);
+    s
+}
+
+/// Pretty-print an OTEL JSON log line into indented key/value lines for the
+/// expanded detail view: timestamp, level, message, error (if any), then the
+/// remaining fields. Non-JSON lines are returned as-is. Pure and testable.
+pub fn pretty_log_line(line: &str) -> Vec<String> {
+    let value: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return vec![line.to_string()],
+    };
+    let mut out = Vec::new();
+    if let Some(ts) = value.get("timestamp").and_then(|v| v.as_str()) {
+        out.push(format!("timestamp: {ts}"));
+    }
+    if let Some(level) = value.get("level").and_then(|v| v.as_str()) {
+        out.push(format!("level:     {level}"));
+    }
+    if let Some(target) = value.get("target").and_then(|v| v.as_str()) {
+        out.push(format!("target:    {target}"));
+    }
+    if let Some(fields) = value.get("fields").and_then(|f| f.as_object()) {
+        // message and error first (the things you actually want to read), then
+        // the rest of the fields.
+        if let Some(msg) = fields.get("message").and_then(|m| m.as_str()) {
+            out.push(format!("message:   {msg}"));
+        }
+        if let Some(err) = fields.get("error").and_then(|e| e.as_str()) {
+            out.push(format!("error:     {err}"));
+        }
+        for (k, v) in fields {
+            if k == "message" || k == "error" {
+                continue;
+            }
+            out.push(format!("  {k}: {}", json_scalar(v)));
+        }
+    }
+    out
+}
+
+/// Render a JSON scalar/compact value for the detail view.
+fn json_scalar(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.chars().count() <= max_len {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_len.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
 pub fn aggregate_log_stats(lines: &[String], top_n: usize) -> LogStats {
     use std::collections::HashMap;
 
@@ -893,6 +973,38 @@ mod tests {
         ];
         let flagged = pods_with_transform_errors(&logs);
         assert_eq!(flagged, vec!["pod-bad"]);
+    }
+
+    #[test]
+    fn log_line_summary_extracts_level_and_message() {
+        let line = r#"{"timestamp":"2026-07-31T08:12:32Z","level":"WARN","fields":{"message":"transform lane Zerobus write error","error":"schema validation failed"},"target":"ssync::sink"}"#;
+        let s = log_line_summary(line, 60);
+        assert!(s.starts_with("WARN"));
+        assert!(s.contains("transform lane Zerobus write error"));
+        // Non-JSON falls back to the raw (truncated) line.
+        assert_eq!(log_line_summary("plain text here", 60), "plain text here");
+    }
+
+    #[test]
+    fn log_line_summary_truncates() {
+        let long = format!(r#"{{"level":"WARN","fields":{{"message":"{}"}}}}"#, "x".repeat(200));
+        let s = log_line_summary(&long, 40);
+        assert!(s.chars().count() <= 40);
+        assert!(s.ends_with('…'));
+    }
+
+    #[test]
+    fn pretty_log_line_expands_fields() {
+        let line = r#"{"timestamp":"2026-07-31T08:12:32Z","level":"ERROR","fields":{"message":"Stream setup failed","error":"Client field '_ssync_record_id' does not exist in Delta schema"},"target":"ssync::sink::zerobus"}"#;
+        let out = pretty_log_line(line);
+        let joined = out.join("\n");
+        assert!(joined.contains("timestamp: 2026-07-31T08:12:32Z"));
+        assert!(joined.contains("level:     ERROR"));
+        assert!(joined.contains("message:   Stream setup failed"));
+        // The full error — the whole point — is present, untruncated.
+        assert!(joined.contains("Client field '_ssync_record_id' does not exist in Delta schema"));
+        // Non-JSON returns as-is.
+        assert_eq!(pretty_log_line("not json"), vec!["not json"]);
     }
 
     #[test]

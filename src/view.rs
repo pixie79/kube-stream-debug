@@ -78,6 +78,12 @@ pub struct ViewState {
     pub kube_focus: KubeFocus,
     /// When set, the pod-detail view is showing this pod.
     pub selected_pod: Option<String>,
+    /// Cursor within the pod-detail log list (which line is highlighted).
+    pub log_cursor: usize,
+    /// Whether the selected log line is expanded to pretty-printed detail.
+    pub log_expanded: bool,
+    /// Whether long lines wrap (true) or are truncated (false) in the detail.
+    pub log_wrap: bool,
     /// When set, the node-detail view is showing this node.
     pub selected_node: Option<String>,
     /// Whether the status-legend help overlay is showing.
@@ -92,6 +98,9 @@ impl Default for ViewState {
             drilled_topic: None,
             kube_focus: KubeFocus::Pods,
             selected_pod: None,
+            log_cursor: 0,
+            log_expanded: false,
+            log_wrap: true,
             selected_node: None,
             show_help: false,
         }
@@ -178,6 +187,8 @@ impl ViewState {
                     self.selected_pod = Some(name.clone());
                     self.view = View::PodDetail;
                     self.cursor = 0;
+                    self.log_cursor = 0;
+                    self.log_expanded = false;
                 }
             }
             KubeFocus::Nodes => {
@@ -192,6 +203,42 @@ impl ViewState {
 
     pub fn toggle_help(&mut self) {
         self.show_help = !self.show_help;
+    }
+
+    /// Move the log cursor down within `len` lines (pod-detail list). No-op when
+    /// a line is expanded (Esc collapses first).
+    pub fn log_cursor_down(&mut self, len: usize) {
+        if !self.log_expanded && len > 0 && self.log_cursor + 1 < len {
+            self.log_cursor += 1;
+        }
+    }
+
+    pub fn log_cursor_up(&mut self) {
+        if !self.log_expanded {
+            self.log_cursor = self.log_cursor.saturating_sub(1);
+        }
+    }
+
+    /// Enter on a log line: expand it to pretty-printed detail. Esc (handled via
+    /// drill_out) collapses. Returns true if it changed state (so the caller
+    /// knows Enter was consumed here rather than drilling elsewhere).
+    pub fn log_expand(&mut self) {
+        self.log_expanded = true;
+    }
+
+    /// Collapse an expanded log line back to the list. Returns true if it was
+    /// expanded (so Esc collapses first, then a second Esc leaves pod-detail).
+    pub fn log_collapse(&mut self) -> bool {
+        if self.log_expanded {
+            self.log_expanded = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn toggle_log_wrap(&mut self) {
+        self.log_wrap = !self.log_wrap;
     }
 }
 
@@ -475,6 +522,36 @@ mod tests {
         assert_eq!(state.view, View::Topic);
         assert!(state.drilled_topic.is_none());
         assert_eq!(state.cursor, 1, "cursor preserved on the way out");
+    }
+
+    #[test]
+    fn log_cursor_and_expand() {
+        let mut state = ViewState { view: View::PodDetail, ..Default::default() };
+        state.log_cursor_down(3);
+        state.log_cursor_down(3);
+        assert_eq!(state.log_cursor, 2);
+        state.log_cursor_down(3); // clamp
+        assert_eq!(state.log_cursor, 2);
+        // Expand freezes the cursor.
+        state.log_expand();
+        assert!(state.log_expanded);
+        state.log_cursor_up(); // no-op while expanded
+        assert_eq!(state.log_cursor, 2);
+        // Collapse returns true, then cursor moves again.
+        assert!(state.log_collapse());
+        assert!(!state.log_expanded);
+        state.log_cursor_up();
+        assert_eq!(state.log_cursor, 1);
+        // Collapse when not expanded returns false (so Esc can leave the view).
+        assert!(!state.log_collapse());
+    }
+
+    #[test]
+    fn log_wrap_defaults_on_and_toggles() {
+        let mut state = ViewState::default();
+        assert!(state.log_wrap);
+        state.toggle_log_wrap();
+        assert!(!state.log_wrap);
     }
 
     #[test]

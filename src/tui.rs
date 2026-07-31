@@ -84,20 +84,57 @@ fn event_loop(
                     _ => frame.topics.len(),
                 };
 
+                // In pod-detail, the log line count bounds the log cursor.
+                let log_len = if state.view == View::PodDetail {
+                    state
+                        .selected_pod
+                        .as_ref()
+                        .and_then(|name| {
+                            frame.kube.as_ref().and_then(|k| {
+                                k.pod_logs.iter().find(|l| &l.pod == name).map(|l| l.lines.len())
+                            })
+                        })
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+
                 match key.code {
                     KeyCode::Char('q') => break,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                     KeyCode::Char('?') => state.toggle_help(),
                     KeyCode::Char('v') => state.cycle_view(),
+                    KeyCode::Char('w') if state.view == View::PodDetail => state.toggle_log_wrap(),
                     KeyCode::Tab if state.view == View::Kube => state.toggle_kube_focus(),
-                    KeyCode::Up | KeyCode::Char('k') => state.cursor_up(),
-                    KeyCode::Down | KeyCode::Char('j') => state.cursor_down(cursor_len),
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if state.view == View::PodDetail {
+                            state.log_cursor_up();
+                        } else {
+                            state.cursor_up();
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if state.view == View::PodDetail {
+                            state.log_cursor_down(log_len);
+                        } else {
+                            state.cursor_down(cursor_len);
+                        }
+                    }
                     KeyCode::Enter => match state.view {
                         View::Kube => state.kube_drill_in(&pod_names, &node_names),
-                        View::PodDetail | View::NodeDetail => {} // already in detail
+                        View::PodDetail => state.log_expand(),
+                        View::NodeDetail => {}
                         _ => state.drill_in(&frame.topics),
                     },
-                    KeyCode::Esc => state.drill_out(),
+                    KeyCode::Esc => {
+                        // In pod-detail, Esc collapses an expanded line first;
+                        // a second Esc leaves the view.
+                        if state.view == View::PodDetail && state.log_collapse() {
+                            // consumed by collapse
+                        } else {
+                            state.drill_out();
+                        }
+                    }
                     KeyCode::Char('r') => {
                         frame = refresh();
                         state.clamp_cursor(frame.topics.len());
@@ -151,7 +188,8 @@ fn draw(f: &mut ratatui::Frame, state: &ViewState, frame: &Frame) {
 
     let help = match state.view {
         View::Kube => " ↑/↓=move  Tab=pods/nodes  Enter=open  Esc=back  v=view  ?=legend  q=quit",
-        View::PodDetail | View::NodeDetail => " Esc=back  ?=legend  r=refresh  q=quit",
+        View::PodDetail => " ↑/↓=select  Enter=expand  Esc=collapse/back  w=wrap  q=quit",
+        View::NodeDetail => " Esc=back  ?=legend  r=refresh  q=quit",
         _ => " ↑/↓=move  Enter=drill in  Esc=back  v=view  ?=legend  r=refresh  q=quit",
     };
     f.render_widget(Paragraph::new(help), chunks[2]);
@@ -533,16 +571,57 @@ fn draw_pod_detail(f: &mut ratatui::Frame, area: Rect, state: &ViewState, frame:
         halves[0],
     );
 
-    // Bottom: raw logs, scrolled to the cursor.
-    let log_lines: Vec<Line> = logs
-        .map(|l| l.lines.iter().map(|s| Line::from(s.clone())).collect())
-        .unwrap_or_else(|| vec![Line::from("no logs captured for this pod")]);
-    f.render_widget(
-        Paragraph::new(log_lines)
-            .block(Block::default().borders(Borders::ALL).title("logs (↑/↓ scroll)"))
-            .scroll((state.cursor as u16, 0)),
-        halves[1],
-    );
+    // Bottom: either the compact log list (cursored) or the expanded detail.
+    if state.log_expanded {
+        // Pretty-print the selected line, full and (optionally) wrapped.
+        let selected = logs
+            .and_then(|l| l.lines.get(state.log_cursor))
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        let pretty = crate::kube::pretty_log_line(selected);
+        let detail: Vec<Line> = pretty.into_iter().map(Line::from).collect();
+        let mut para = Paragraph::new(detail).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("log entry (Esc collapse · w wrap)"),
+        );
+        if state.log_wrap {
+            para = para.wrap(ratatui::widgets::Wrap { trim: false });
+        }
+        f.render_widget(para, halves[1]);
+    } else {
+        // Compact one-line-per-entry list with the cursor highlighted. Width
+        // caps the summary so it never overflows the pane.
+        let width = halves[1].width.saturating_sub(2) as usize;
+        let rows: Vec<Line> = logs
+            .map(|l| {
+                l.lines
+                    .iter()
+                    .enumerate()
+                    .map(|(i, line)| {
+                        let text = crate::kube::log_line_summary(line, width);
+                        if i == state.log_cursor {
+                            Line::from(Span::styled(
+                                text,
+                                Style::default().add_modifier(Modifier::REVERSED),
+                            ))
+                        } else {
+                            Line::from(text)
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![Line::from("no logs captured for this pod")]);
+        // Scroll so the cursor stays visible: keep it near the middle.
+        let visible = halves[1].height.saturating_sub(2) as usize;
+        let scroll = state.log_cursor.saturating_sub(visible / 2) as u16;
+        f.render_widget(
+            Paragraph::new(rows)
+                .block(Block::default().borders(Borders::ALL).title("logs (↑/↓ select · Enter expand)"))
+                .scroll((scroll, 0)),
+            halves[1],
+        );
+    }
 }
 
 /// Node-detail view: node capacity + which pods run on it (node-scoped only).
