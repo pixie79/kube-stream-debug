@@ -110,6 +110,26 @@ assert    = { worker_count = "24", batch_size = "30" }
 
 CLI `--kube-assert` entries merge with the config `assert` table (the CLI wins on a duplicate key). A typoed key in `[kube]` is a hard error, like the rest of the config.
 
+### Operational settings in the config file
+
+The rest of the command-line flags can also live in the config, under a `[settings]` section, so a configuration you run often doesn't need a long command line. Every field is optional, and a CLI flag always overrides the config value:
+
+```toml
+[settings]
+format              = "table"        # or "jsonl"
+concurrency         = 8
+timeout_secs        = 30
+drain_window_secs   = 30             # 0 skips the trend/ETA second sample
+watch               = false
+tui                 = false
+watch_interval_secs = 60
+json_dir            = "./snapshots"
+json_dir_max_files  = 100            # 0 keeps all
+problems_only       = false
+```
+
+So a run like `pulsar-topic-health -c prod.toml --watch --tui --json-dir ./snapshots --kube` can become just `pulsar-topic-health -c prod.toml` with `watch`, `tui`, `json_dir` set in `[settings]` and `enabled = true` in `[kube]`. The mode switches (`watch`, `tui`, `problems_only`) can be turned on by the flag or the config; neither can force them off. A typoed key in `[settings]` is a hard error, like the rest of the config.
+
 ### When no pods match
 
 If a `--kube` run matches no pods, the tool helps you find the right target rather than printing a dead "no pods matched" line. In a plain one-shot run it prints the choices and exits with code 3: if the **namespace** doesn't exist, it lists the available namespaces; if the namespace exists but the **selector** missed, it lists the label keys and their distinct values on the namespace's pods, and suggests a ready-to-paste selector when there's an obvious `app.kubernetes.io/name` (or `app`/`k8s-app`) label. In `--watch` or `--tui` the same discovery is shown in the kube panel instead, and the session keeps running (so a consumer that's briefly scaled to zero doesn't kill your watch).

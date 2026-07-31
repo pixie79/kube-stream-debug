@@ -48,8 +48,8 @@ struct Cli {
     config: PathBuf,
 
     /// Output format.
-    #[arg(long, value_enum, default_value_t = Format::Table)]
-    format: Format,
+    #[arg(long, value_enum)]
+    format: Option<Format>,
 
     /// Override the per-partition backlog threshold from the config.
     #[arg(long)]
@@ -64,18 +64,18 @@ struct Cli {
     admin_url: Option<String>,
 
     /// Concurrent stats requests.
-    #[arg(long, default_value_t = 8)]
-    concurrency: usize,
+    #[arg(long)]
+    concurrency: Option<usize>,
 
     /// Per-request timeout in seconds.
-    #[arg(long, default_value_t = 30)]
-    timeout_secs: u64,
+    #[arg(long)]
+    timeout_secs: Option<u64>,
 
     /// Seconds between the two backlog samples used to compute drain trend and
     /// ETA-to-clear. Set 0 to skip the second sample and the trend columns.
     /// Ignored in --watch mode (trend is derived from consecutive cycles).
-    #[arg(long, default_value_t = 30)]
-    drain_window_secs: u64,
+    #[arg(long)]
+    drain_window_secs: Option<u64>,
 
     /// Run continuously, redrawing every --watch-interval-secs. Trend is derived
     /// from the previous cycle rather than a mid-cycle second sample.
@@ -87,8 +87,8 @@ struct Cli {
     tui: bool,
 
     /// Seconds between watch cycles (only with --watch).
-    #[arg(long, default_value_t = 60)]
-    watch_interval_secs: u64,
+    #[arg(long)]
+    watch_interval_secs: Option<u64>,
 
     /// Directory to write a JSON snapshot per cycle (created if absent). Works
     /// with or without --watch; in a single run it writes one snapshot.
@@ -97,8 +97,8 @@ struct Cli {
 
     /// Maximum snapshot files to keep in --json-dir; older ones are pruned.
     /// 0 means keep all.
-    #[arg(long, default_value_t = 100)]
-    json_dir_max_files: usize,
+    #[arg(long)]
+    json_dir_max_files: Option<usize>,
 
     /// Only show unhealthy topics in the output.
     #[arg(long)]
@@ -144,6 +144,52 @@ fn parse_key_value(s: &str) -> Result<(String, String), String> {
     }
 }
 
+impl Cli {
+    /// Resolved values with their final defaults applied, after config merge.
+    /// These are the single source of truth downstream code reads, so the
+    /// clap-default / config / CLI precedence lives in exactly one place.
+    fn format(&self) -> Format {
+        self.format.unwrap_or(Format::Table)
+    }
+    fn concurrency(&self) -> usize {
+        self.concurrency.unwrap_or(8)
+    }
+    fn timeout_secs(&self) -> u64 {
+        self.timeout_secs.unwrap_or(30)
+    }
+    fn drain_window_secs(&self) -> u64 {
+        self.drain_window_secs.unwrap_or(30)
+    }
+    fn watch_interval_secs(&self) -> u64 {
+        self.watch_interval_secs.unwrap_or(60)
+    }
+    fn json_dir_max_files(&self) -> usize {
+        self.json_dir_max_files.unwrap_or(100)
+    }
+}
+
+/// Fold `[settings]` config defaults into the parsed CLI. For Option fields a
+/// present CLI value wins; else the config value fills in; else the accessor
+/// applies the final default. Bare bools are OR-ed — the flag or config can
+/// enable a mode, neither can force it off (clap bools have no explicit false).
+fn apply_settings(cli: &mut Cli, s: &config::Settings) {
+    if cli.format.is_none() {
+        cli.format = s.format.map(|f| match f {
+            config::OutputFormat::Table => Format::Table,
+            config::OutputFormat::Jsonl => Format::Jsonl,
+        });
+    }
+    cli.concurrency = cli.concurrency.or(s.concurrency);
+    cli.timeout_secs = cli.timeout_secs.or(s.timeout_secs);
+    cli.drain_window_secs = cli.drain_window_secs.or(s.drain_window_secs);
+    cli.watch_interval_secs = cli.watch_interval_secs.or(s.watch_interval_secs);
+    cli.json_dir_max_files = cli.json_dir_max_files.or(s.json_dir_max_files);
+    cli.json_dir = cli.json_dir.clone().or_else(|| s.json_dir.clone());
+    cli.watch |= s.watch.unwrap_or(false);
+    cli.tui |= s.tui.unwrap_or(false);
+    cli.problems_only |= s.problems_only.unwrap_or(false);
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(exit) => exit,
@@ -155,8 +201,12 @@ fn main() -> ExitCode {
 }
 
 fn run() -> anyhow::Result<ExitCode> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     let config = Config::load(&cli.config)?;
+
+    // Merge [settings] into the CLI (CLI wins). Done here so every downstream
+    // function just reads the already-resolved `cli`.
+    apply_settings(&mut cli, &config.settings);
 
     let admin_url = cli
         .admin_url
@@ -168,7 +218,7 @@ fn run() -> anyhow::Result<ExitCode> {
     let token = resolve_token()?;
 
     let topics = parse_topics(&config.topics)?;
-    let client = AdminClient::new(&admin_url, &token, Duration::from_secs(cli.timeout_secs));
+    let client = AdminClient::new(&admin_url, &token, Duration::from_secs(cli.timeout_secs()));
 
     let colors = config.colors;
     let kube_config = config.kube;
@@ -201,7 +251,7 @@ fn run_tui(
     let refresh = move || {
         let now = std::time::Instant::now();
         let run_at = timestamp::now_rfc3339();
-        let mut results = check_all(client, topics, subscription, threshold, cli.concurrency);
+        let mut results = check_all(client, topics, subscription, threshold, cli.concurrency());
         if let Some((prev_backlogs, prev_at)) = &prev {
             let window = now.duration_since(*prev_at).as_secs_f64();
             apply_interval_drain(&mut results, prev_backlogs, window);
@@ -222,7 +272,7 @@ fn run_tui(
         // on-disk history is complete.
         if let Some(dir) = &cli.json_dir {
             if let Err(err) =
-                snapshot::write_snapshot(dir, &results, &run_at, cli.json_dir_max_files)
+                snapshot::write_snapshot(dir, &results, &run_at, cli.json_dir_max_files())
             {
                 eprintln!("Warning: {err}");
             }
@@ -236,7 +286,7 @@ fn run_tui(
         }
     };
 
-    tui::run(Box::new(refresh), Duration::from_secs(cli.watch_interval_secs.max(1)))?;
+    tui::run(Box::new(refresh), Duration::from_secs(cli.watch_interval_secs().max(1)))?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -252,7 +302,7 @@ fn single_run(
     threshold: i64,
 ) -> anyhow::Result<ExitCode> {
     let run_at = timestamp::now_rfc3339();
-    let mut results = check_all(client, topics, subscription, threshold, cli.concurrency);
+    let mut results = check_all(client, topics, subscription, threshold, cli.concurrency());
 
     // Kubernetes correlation (optional). Fetch this *before* the drain sample:
     // if --kube matched no pods, we're going to exit with discovery help
@@ -265,14 +315,14 @@ fn single_run(
             return Ok(ExitCode::from(3));
         }
 
-    if cli.drain_window_secs > 0 {
+    if cli.drain_window_secs() > 0 {
         measure_drain(
             client,
             topics,
             subscription,
             &mut results,
-            cli.drain_window_secs,
-            cli.concurrency,
+            cli.drain_window_secs(),
+            cli.concurrency(),
         );
     }
 
@@ -292,7 +342,7 @@ fn single_run(
     }
 
     if let Some(dir) = &cli.json_dir
-        && let Err(err) = snapshot::write_snapshot(dir, &results, &run_at, cli.json_dir_max_files) {
+        && let Err(err) = snapshot::write_snapshot(dir, &results, &run_at, cli.json_dir_max_files()) {
             eprintln!("Warning: {err}");
         }
 
@@ -302,7 +352,7 @@ fn single_run(
         results
     };
 
-    match cli.format {
+    match cli.format() {
         Format::Table => {
             println!("as of {run_at}");
             if let Some(report) = &kube_report {
@@ -357,7 +407,7 @@ fn watch_loop(
     subscription: &str,
     threshold: i64,
 ) -> anyhow::Result<ExitCode> {
-    let interval = Duration::from_secs(cli.watch_interval_secs.max(1));
+    let interval = Duration::from_secs(cli.watch_interval_secs().max(1));
 
     // Previous cycle's per-topic backlog (keyed by topic name) and the instant
     // it was captured, so the next cycle can compute net drain over real
@@ -377,7 +427,7 @@ fn watch_loop(
     loop {
         let cycle_start = std::time::Instant::now();
         let run_at = timestamp::now_rfc3339();
-        let mut results = check_all(client, topics, subscription, threshold, cli.concurrency);
+        let mut results = check_all(client, topics, subscription, threshold, cli.concurrency());
 
         // Derive drain from the previous cycle rather than a fresh second sample.
         if let Some((prev_backlogs, prev_at)) = &prev {
@@ -399,7 +449,7 @@ fn watch_loop(
         // Snapshot the full (unfiltered) results before any --problems-only trim.
         if let Some(dir) = &cli.json_dir
             && let Err(err) =
-                snapshot::write_snapshot(dir, &results, &run_at, cli.json_dir_max_files)
+                snapshot::write_snapshot(dir, &results, &run_at, cli.json_dir_max_files())
             {
                 eprintln!("Warning: {err}");
             }
@@ -423,11 +473,11 @@ fn watch_loop(
 
         clear_screen();
         let unhealthy = display.iter().filter(|h| !h.status.is_healthy()).count();
-        match cli.format {
+        match cli.format() {
             Format::Table => {
                 println!(
                     "as of {run_at}   (watch: every {}s, ctrl-c to stop)",
-                    cli.watch_interval_secs
+                    cli.watch_interval_secs()
                 );
                 if let Some(report) = &kube_report {
                     print!("{}", output::render_kube_section(report));

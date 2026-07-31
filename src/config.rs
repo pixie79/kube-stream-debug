@@ -68,6 +68,42 @@ pub struct Config {
     /// these; `--kube` or `kube.enabled = true` activates the correlation.
     #[serde(default)]
     pub kube: KubeConfig,
+
+    /// Optional operational defaults (format, concurrency, watch/tui, json-dir,
+    /// …). Every field is optional; a CLI flag overrides the config value.
+    #[serde(default)]
+    pub settings: Settings,
+}
+
+/// Operational defaults settable in the config `[settings]` table, so a
+/// frequently-run configuration doesn't need a long command line. Every field
+/// is optional and overridden by the matching CLI flag. Booleans (`watch`,
+/// `tui`, `problems_only`) are OR-ed with the flag: the flag turns them on, and
+/// config can turn them on too, but neither can force them off (clap bools have
+/// no explicit false).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Settings {
+    pub format: Option<OutputFormat>,
+    pub concurrency: Option<usize>,
+    pub timeout_secs: Option<u64>,
+    pub drain_window_secs: Option<u64>,
+    pub watch: Option<bool>,
+    pub tui: Option<bool>,
+    pub watch_interval_secs: Option<u64>,
+    pub json_dir: Option<std::path::PathBuf>,
+    pub json_dir_max_files: Option<usize>,
+    pub problems_only: Option<bool>,
+}
+
+/// Output format, mirrored from the CLI enum so the config can name it. Kept
+/// separate from main's `Format` to avoid a config→main dependency; converted
+/// at the merge site.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputFormat {
+    Table,
+    Jsonl,
 }
 
 /// Kubernetes correlation settings from the config file. Every field is
@@ -289,5 +325,57 @@ mod tests {
             "#,
         );
         assert!(result.is_err(), "typoed kube field must be rejected");
+    }
+
+    #[test]
+    fn parses_settings_section() {
+        let config: Config = toml::from_str(
+            r#"
+            subscription = "sub"
+            topics = ["a/b/c"]
+            [settings]
+            format = "jsonl"
+            concurrency = 16
+            watch = true
+            tui = true
+            json_dir = "./snapshots/x"
+            json_dir_max_files = 50
+            problems_only = true
+            "#,
+        )
+        .expect("settings section should parse");
+        assert_eq!(config.settings.format, Some(OutputFormat::Jsonl));
+        assert_eq!(config.settings.concurrency, Some(16));
+        assert_eq!(config.settings.watch, Some(true));
+        assert_eq!(config.settings.tui, Some(true));
+        assert_eq!(config.settings.json_dir.as_deref(), Some(std::path::Path::new("./snapshots/x")));
+        assert_eq!(config.settings.json_dir_max_files, Some(50));
+    }
+
+    #[test]
+    fn settings_section_defaults_empty() {
+        let config: Config = toml::from_str(
+            r#"
+            subscription = "sub"
+            topics = ["a/b/c"]
+            "#,
+        )
+        .unwrap();
+        assert!(config.settings.format.is_none());
+        assert!(config.settings.concurrency.is_none());
+        assert!(config.settings.watch.is_none());
+    }
+
+    #[test]
+    fn rejects_unknown_settings_fields() {
+        let result: Result<Config, _> = toml::from_str(
+            r#"
+            subscription = "sub"
+            topics = ["a/b/c"]
+            [settings]
+            concurency = 4
+            "#,
+        );
+        assert!(result.is_err(), "typoed settings field must be rejected");
     }
 }
