@@ -92,6 +92,22 @@ pulsar-topic-health --kube \
 
 Authentication is whatever `kubectl` already uses — the tool calls `kube-rs`'s default config inference, which reads `~/.kube/config`, `KUBECONFIG`, or an in-cluster service-account token. No separate setup.
 
+### Kube settings in the config file
+
+Rather than passing the `--kube-*` flags every time, put them in a `[kube]` section of the config. Either `--kube` on the command line **or** `enabled = true` in the section activates the correlation, and any CLI flag overrides the corresponding config value:
+
+```toml
+[kube]
+enabled   = true                 # activates without needing --kube
+namespace = "my-ns"
+selector  = "app=my-consumer"
+configmap = "my-consumer-config"
+log_tail  = 200
+assert    = { worker_count = "24", batch_size = "30" }
+```
+
+CLI `--kube-assert` entries merge with the config `assert` table (the CLI wins on a duplicate key). A typoed key in `[kube]` is a hard error, like the rest of the config.
+
 It renders a pod-summary section above the topic table (pod name, ready count, restarts, age, state — with `OOMKilled`/`CrashLoopBackOff` highlighted), flags a split rollout (more than one image) or large rollout skew (pods not restarted together), lists recent OOM/eviction events, prints any failed `--kube-assert` config checks, and scans the last N log lines per pod (`--kube-log-tail`, default 200) for ramp/OOM/error/config signals. Unhealthy topics also gain a short correlation hint in their `DETAIL` (e.g. `kube: 2 pod(s) OOM-killed`). In JSONL mode the full kube report is emitted as one extra line before the topic lines.
 
 The Kubernetes side is strictly best-effort and isolated: if the cluster is unreachable or auth fails, the tool prints an `unreachable` notice and still renders the full Pulsar report. A consumer-side problem (failed pods, failed config assertion, split rollout) contributes to the non-zero exit code alongside topic health, so `--kube` works as a post-deploy gate.

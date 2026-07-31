@@ -20,6 +20,16 @@
 //! size_crit    = 5368709120      # 5 GiB
 //! unacked_warn = 50000
 //! unacked_crit = 200000
+//!
+//! # Optional Kubernetes correlation. `--kube` or `enabled = true` activates it;
+//! # CLI --kube-* flags override any value here.
+//! [kube]
+//! enabled   = true
+//! namespace = "my-ns"
+//! selector  = "app=my-consumer"
+//! configmap = "my-consumer-config"
+//! log_tail  = 200
+//! assert    = { worker_count = "24", batch_size = "30" }
 //! ```
 
 use std::fs;
@@ -53,6 +63,29 @@ pub struct Config {
     /// Optional per-column colour thresholds for table output.
     #[serde(default)]
     pub colors: ColorThresholds,
+
+    /// Optional Kubernetes correlation settings. CLI `--kube-*` flags override
+    /// these; `--kube` or `kube.enabled = true` activates the correlation.
+    #[serde(default)]
+    pub kube: KubeConfig,
+}
+
+/// Kubernetes correlation settings from the config file. Every field is
+/// optional; CLI flags override any value set here. `assert` is an inline table
+/// of `config.toml` key → expected-value pairs.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KubeConfig {
+    /// Activate correlation from config alone (equivalent to passing `--kube`).
+    #[serde(default)]
+    pub enabled: bool,
+    pub namespace: Option<String>,
+    pub selector: Option<String>,
+    pub configmap: Option<String>,
+    pub log_tail: Option<i64>,
+    /// config.toml assertions as an inline table: `assert = { key = "v", ... }`.
+    #[serde(default)]
+    pub assert: std::collections::BTreeMap<String, String>,
 }
 
 /// Warn/crit thresholds that drive the colour of the BACKLOG, SIZE and UNACKED
@@ -207,5 +240,56 @@ mod tests {
             "#,
         );
         assert!(result.is_err(), "typoed field names must be rejected");
+    }
+
+    #[test]
+    fn parses_kube_section() {
+        let config: Config = toml::from_str(
+            r#"
+            subscription = "sub"
+            topics = ["a/b/c"]
+            [kube]
+            enabled = true
+            namespace = "my-ns"
+            selector = "app=my-consumer"
+            configmap = "my-cm"
+            log_tail = 500
+            assert = { worker_count = "24", batch_size = "30" }
+            "#,
+        )
+        .expect("kube section should parse");
+        assert!(config.kube.enabled);
+        assert_eq!(config.kube.namespace.as_deref(), Some("my-ns"));
+        assert_eq!(config.kube.selector.as_deref(), Some("app=my-consumer"));
+        assert_eq!(config.kube.log_tail, Some(500));
+        assert_eq!(config.kube.assert.get("worker_count").map(String::as_str), Some("24"));
+        assert_eq!(config.kube.assert.len(), 2);
+    }
+
+    #[test]
+    fn kube_section_defaults_to_disabled() {
+        let config: Config = toml::from_str(
+            r#"
+            subscription = "sub"
+            topics = ["a/b/c"]
+            "#,
+        )
+        .unwrap();
+        assert!(!config.kube.enabled);
+        assert!(config.kube.selector.is_none());
+        assert!(config.kube.assert.is_empty());
+    }
+
+    #[test]
+    fn rejects_unknown_kube_fields() {
+        let result: Result<Config, _> = toml::from_str(
+            r#"
+            subscription = "sub"
+            topics = ["a/b/c"]
+            [kube]
+            selctor = "app=x"
+            "#,
+        );
+        assert!(result.is_err(), "typoed kube field must be rejected");
     }
 }

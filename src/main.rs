@@ -112,26 +112,30 @@ struct Cli {
     #[arg(long)]
     kube: bool,
 
-    /// Kubernetes namespace of the consumer pods.
-    #[arg(long, default_value = "default")]
-    kube_namespace: String,
+    /// Kubernetes namespace of the consumer pods (overrides config; default
+    /// `default`).
+    #[arg(long)]
+    kube_namespace: Option<String>,
 
-    /// Label selector for the consumer pods, e.g. `app=my-consumer`.
+    /// Label selector for the consumer pods, e.g. `app=my-consumer` (overrides
+    /// config).
     #[arg(long)]
     kube_selector: Option<String>,
 
-    /// ConfigMap name to read `config.toml` from for --kube-assert checks.
+    /// ConfigMap name to read `config.toml` from for --kube-assert checks
+    /// (overrides config).
     #[arg(long)]
     kube_configmap: Option<String>,
 
-    /// Assert a config.toml `key=value` (repeatable), e.g.
-    /// `--kube-assert worker_count=24`.
+    /// Assert a config.toml `key=value` (repeatable), merged with config
+    /// asserts (CLI wins on duplicate keys).
     #[arg(long = "kube-assert", value_parser = parse_key_value)]
     kube_assert: Vec<(String, String)>,
 
-    /// Scan the last N log lines per pod for ramp/OOM/error signals (0 = skip).
-    #[arg(long, default_value_t = 200)]
-    kube_log_tail: i64,
+    /// Scan the last N log lines per pod for ramp/OOM/error signals (overrides
+    /// config; default 200, 0 = skip).
+    #[arg(long)]
+    kube_log_tail: Option<i64>,
 }
 
 /// Parse a `key=value` pair for --kube-assert.
@@ -168,13 +172,16 @@ fn run() -> anyhow::Result<ExitCode> {
     let topics = parse_topics(&config.topics)?;
     let client = AdminClient::new(&admin_url, &token, Duration::from_secs(cli.timeout_secs));
 
+    let colors = config.colors;
+    let kube_config = config.kube;
+
     if cli.tui {
-        return run_tui(&cli, &client, &topics, &subscription, threshold);
+        return run_tui(&cli, &kube_config, &client, &topics, &subscription, threshold);
     }
     if cli.watch {
-        watch_loop(&cli, &config.colors, &client, &topics, &subscription, threshold)
+        watch_loop(&cli, &colors, &kube_config, &client, &topics, &subscription, threshold)
     } else {
-        single_run(&cli, &config.colors, &client, &topics, &subscription, threshold)
+        single_run(&cli, &colors, &kube_config, &client, &topics, &subscription, threshold)
     }
 }
 
@@ -182,6 +189,7 @@ fn run() -> anyhow::Result<ExitCode> {
 #[cfg(feature = "tui")]
 fn run_tui(
     cli: &Cli,
+    kube_config: &config::KubeConfig,
     client: &AdminClient,
     topics: &[TopicName],
     subscription: &str,
@@ -207,7 +215,7 @@ fn run_tui(
             results.iter().map(|h| (h.topic.clone(), h.total_backlog)).collect();
         prev = Some((backlogs, now));
 
-        let kube = fetch_kube_report(cli);
+        let kube = fetch_kube_report(cli, kube_config);
         if let Some(report) = &kube {
             annotate_with_kube(&mut results, report);
         }
@@ -226,6 +234,7 @@ fn run_tui(
 #[cfg(not(feature = "tui"))]
 fn run_tui(
     _cli: &Cli,
+    _kube_config: &config::KubeConfig,
     _client: &AdminClient,
     _topics: &[TopicName],
     _subscription: &str,
@@ -240,6 +249,7 @@ fn run_tui(
 fn single_run(
     cli: &Cli,
     colors: &config::ColorThresholds,
+    kube_config: &config::KubeConfig,
     client: &AdminClient,
     topics: &[TopicName],
     subscription: &str,
@@ -272,7 +282,7 @@ fn single_run(
 
     // Kubernetes correlation (optional): fetch the consumer deployment's health
     // and annotate unhealthy topics with a pod-side hint.
-    let kube_report = fetch_kube_report(cli);
+    let kube_report = fetch_kube_report(cli, kube_config);
     if let Some(report) = &kube_report {
         annotate_with_kube(&mut results, report);
     }
@@ -339,6 +349,7 @@ fn annotate_with_kube(results: &mut [TopicHealth], report: &kube::KubeReport) {
 fn watch_loop(
     cli: &Cli,
     colors: &config::ColorThresholds,
+    kube_config: &config::KubeConfig,
     client: &AdminClient,
     topics: &[TopicName],
     subscription: &str,
@@ -378,7 +389,7 @@ fn watch_loop(
         prior_state = state::prior_from_results(&results);
 
         // Kubernetes correlation each cycle (optional).
-        let kube_report = fetch_kube_report(cli);
+        let kube_report = fetch_kube_report(cli, kube_config);
         if let Some(report) = &kube_report {
             annotate_with_kube(&mut results, report);
         }
@@ -472,25 +483,94 @@ fn clear_screen() {
 }
 
 /// Fetch the Kubernetes report if `--kube` is set. Feature-gated: without the
-/// `kube` feature this returns a helpful message so the flag isn't silently
-/// ignored.
-#[cfg(feature = "kube")]
-fn fetch_kube_report(cli: &Cli) -> Option<kube::KubeReport> {
-    if !cli.kube {
+/// The merged Kubernetes settings after combining config file and CLI flags.
+/// CLI values win over config; activation is `--kube` OR `kube.enabled`. Fields
+/// are consumed by the feature-gated fetch, so allow them to be unread without
+/// the `kube` feature.
+#[cfg_attr(not(feature = "kube"), allow(dead_code))]
+struct ResolvedKube {
+    namespace: String,
+    selector: Option<String>,
+    configmap: Option<String>,
+    log_tail: i64,
+    assert: Vec<(String, String)>,
+}
+
+/// Resolve kube settings from config + CLI, or `None` if kube isn't active.
+/// Pure and testable — no async, no feature gate.
+fn resolve_kube(cli: &Cli, kc: &config::KubeConfig) -> Option<ResolvedKube> {
+    merge_kube_settings(
+        cli.kube,
+        kc,
+        cli.kube_namespace.as_deref(),
+        cli.kube_selector.as_deref(),
+        cli.kube_configmap.as_deref(),
+        cli.kube_log_tail,
+        &cli.kube_assert,
+    )
+}
+
+/// The pure core of `resolve_kube`, taking plain values so it can be unit-tested
+/// without constructing a clap `Cli`. CLI arguments override config; activation
+/// is `flag_kube` OR `kc.enabled`.
+fn merge_kube_settings(
+    flag_kube: bool,
+    kc: &config::KubeConfig,
+    cli_namespace: Option<&str>,
+    cli_selector: Option<&str>,
+    cli_configmap: Option<&str>,
+    cli_log_tail: Option<i64>,
+    cli_assert: &[(String, String)],
+) -> Option<ResolvedKube> {
+    if !(flag_kube || kc.enabled) {
         return None;
     }
-    let Some(selector) = cli.kube_selector.clone() else {
+    let namespace = cli_namespace
+        .map(str::to_string)
+        .or_else(|| kc.namespace.clone())
+        .unwrap_or_else(|| "default".to_string());
+    let selector = cli_selector
+        .map(str::to_string)
+        .or_else(|| kc.selector.clone());
+    let configmap = cli_configmap
+        .map(str::to_string)
+        .or_else(|| kc.configmap.clone());
+    let log_tail = cli_log_tail.or(kc.log_tail).unwrap_or(200);
+    // Merge asserts: config first, CLI appended (CLI wins on duplicate keys).
+    let mut assert: Vec<(String, String)> =
+        kc.assert.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    for (k, v) in cli_assert {
+        assert.retain(|(ek, _)| ek != k);
+        assert.push((k.clone(), v.clone()));
+    }
+    Some(ResolvedKube {
+        namespace,
+        selector,
+        configmap,
+        log_tail,
+        assert,
+    })
+}
+
+/// Fetch the Kubernetes report if kube is active (via `--kube` or config).
+/// Feature-gated: without the `kube` feature this returns a helpful message so
+/// the flag isn't silently ignored.
+#[cfg(feature = "kube")]
+fn fetch_kube_report(cli: &Cli, kube_config: &config::KubeConfig) -> Option<kube::KubeReport> {
+    let resolved = resolve_kube(cli, kube_config)?;
+    let Some(selector) = resolved.selector.clone() else {
         return Some(kube::KubeReport::unreachable(
-            &cli.kube_namespace,
-            "--kube-selector is required with --kube".to_string(),
+            &resolved.namespace,
+            "kube selector is required (set --kube-selector or kube.selector in config)"
+                .to_string(),
         ));
     };
     let query = kube::client::KubeQuery {
-        namespace: cli.kube_namespace.clone(),
+        namespace: resolved.namespace.clone(),
         selector,
-        configmap: cli.kube_configmap.clone(),
-        expected_config: cli.kube_assert.clone(),
-        log_tail: (cli.kube_log_tail > 0).then_some(cli.kube_log_tail),
+        configmap: resolved.configmap.clone(),
+        expected_config: resolved.assert.clone(),
+        log_tail: (resolved.log_tail > 0).then_some(resolved.log_tail),
         event_window_secs: 30 * 60,
     };
     // Small dedicated runtime: the rest of the tool is sync, so we don't want a
@@ -502,7 +582,7 @@ fn fetch_kube_report(cli: &Cli) -> Option<kube::KubeReport> {
         Ok(rt) => rt,
         Err(e) => {
             return Some(kube::KubeReport::unreachable(
-                &cli.kube_namespace,
+                &resolved.namespace,
                 format!("failed to start async runtime: {e}"),
             ))
         }
@@ -511,10 +591,10 @@ fn fetch_kube_report(cli: &Cli) -> Option<kube::KubeReport> {
 }
 
 #[cfg(not(feature = "kube"))]
-fn fetch_kube_report(cli: &Cli) -> Option<kube::KubeReport> {
-    if cli.kube {
+fn fetch_kube_report(cli: &Cli, kube_config: &config::KubeConfig) -> Option<kube::KubeReport> {
+    if resolve_kube(cli, kube_config).is_some() {
         eprintln!(
-            "Warning: --kube requires the tool to be built with `--features kube`; ignoring."
+            "Warning: Kubernetes correlation requires the tool to be built with `--features kube`; ignoring."
         );
     }
     None
@@ -637,4 +717,81 @@ where
             None => unreachable!("every item produces a result"),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod kube_resolve_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn kc(enabled: bool) -> config::KubeConfig {
+        config::KubeConfig {
+            enabled,
+            namespace: Some("cfg-ns".to_string()),
+            selector: Some("app=cfg".to_string()),
+            configmap: Some("cfg-cm".to_string()),
+            log_tail: Some(100),
+            assert: BTreeMap::from([
+                ("worker_count".to_string(), "24".to_string()),
+                ("batch_size".to_string(), "30".to_string()),
+            ]),
+        }
+    }
+
+    #[test]
+    fn inactive_when_neither_flag_nor_enabled() {
+        let disabled = config::KubeConfig::default();
+        assert!(merge_kube_settings(false, &disabled, None, None, None, None, &[]).is_none());
+    }
+
+    #[test]
+    fn flag_activates_with_defaults() {
+        let disabled = config::KubeConfig::default();
+        let r = merge_kube_settings(true, &disabled, None, Some("app=x"), None, None, &[])
+            .expect("active via flag");
+        assert_eq!(r.namespace, "default");
+        assert_eq!(r.selector.as_deref(), Some("app=x"));
+        assert_eq!(r.log_tail, 200);
+    }
+
+    #[test]
+    fn config_enabled_activates_without_flag() {
+        let r = merge_kube_settings(false, &kc(true), None, None, None, None, &[])
+            .expect("active via config.enabled");
+        assert_eq!(r.namespace, "cfg-ns");
+        assert_eq!(r.selector.as_deref(), Some("app=cfg"));
+        assert_eq!(r.log_tail, 100);
+        assert_eq!(r.assert.len(), 2);
+    }
+
+    #[test]
+    fn cli_overrides_config() {
+        let r = merge_kube_settings(
+            true,
+            &kc(true),
+            Some("cli-ns"),
+            Some("app=cli"),
+            Some("cli-cm"),
+            Some(500),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(r.namespace, "cli-ns");
+        assert_eq!(r.selector.as_deref(), Some("app=cli"));
+        assert_eq!(r.configmap.as_deref(), Some("cli-cm"));
+        assert_eq!(r.log_tail, 500);
+    }
+
+    #[test]
+    fn asserts_merge_cli_wins_on_duplicate() {
+        let cli_assert = vec![
+            ("worker_count".to_string(), "48".to_string()), // overrides config's 24
+            ("new_key".to_string(), "1".to_string()),       // additional
+        ];
+        let r = merge_kube_settings(true, &kc(true), None, None, None, None, &cli_assert).unwrap();
+        let map: std::collections::HashMap<_, _> = r.assert.into_iter().collect();
+        assert_eq!(map.get("worker_count").map(String::as_str), Some("48"));
+        assert_eq!(map.get("batch_size").map(String::as_str), Some("30"));
+        assert_eq!(map.get("new_key").map(String::as_str), Some("1"));
+    }
 }

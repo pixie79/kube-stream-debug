@@ -171,6 +171,18 @@ Flags: `--kube` (enable), `--kube-namespace` (default `default`), `--kube-select
 
 Authentication is inherited from the environment exactly as `kubectl` gets it — `kube-rs`'s default config inference reads `~/.kube/config`, `KUBECONFIG`, or an in-cluster service-account token. No token flag, and the agent must never put kube credentials in files or output.
 
+**Settings can live in the config file** instead of on the command line, via a `[kube]` section. Either `--kube` or `enabled = true` in the section activates correlation; CLI flags override config values, and `--kube-assert` entries merge with the config `assert` table (CLI wins on duplicate keys):
+
+```toml
+[kube]
+enabled   = true
+namespace = "my-ns"
+selector  = "app=my-consumer"
+configmap = "my-consumer-config"
+log_tail  = 200
+assert    = { worker_count = "24", batch_size = "30" }
+```
+
 What it shows:
 - A **pod-summary section** above the topic table: pod name, ready count, restarts, age, and state (with `OOMKilled` / `CrashLoopBackOff` highlighted).
 - **Rollout flags**: a split rollout (more than one image across pods) or large rollout skew (pods not restarted together — a rollout may be incomplete or a pod is stale).

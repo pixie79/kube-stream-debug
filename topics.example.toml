@@ -30,3 +30,14 @@ size_warn    = 1073741824       # 1 GiB
 size_crit    = 5368709120       # 5 GiB
 unacked_warn = 50000
 unacked_crit = 200000
+
+# Optional Kubernetes correlation (needs a binary built with --features kube).
+# Either `--kube` on the CLI or `enabled = true` here activates it; CLI --kube-*
+# flags override these values. `assert` checks values in the pods' config.toml.
+[kube]
+enabled   = true
+namespace = "my-ns"
+selector  = "app=my-consumer"
+configmap = "my-consumer-config"
+log_tail  = 200
+assert    = { worker_count = "24", batch_size = "30" }
