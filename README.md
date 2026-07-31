@@ -54,23 +54,22 @@ The tool includes a full-screen interactive terminal UI that refreshes live and 
 pulsar-topic-health --tui
 ```
 
-Four views, cycled with `v`:
+Three views, cycled with `v`:
 
-- **topic** — the classic per-topic table, with a cursor you move with ↑/↓.
-- **partition** — one row per partition, flattened across all topics.
-- **kube** — the Kubernetes pod-summary section (populated when also built and run with `--kube`).
+- **topic** — the classic per-topic table, with a cursor you move with ↑/↓. TREND and ETA columns appear once drain data is available (from the second refresh onward, or with `--drain-window-secs`).
+- **kube** — the Kubernetes pod-and-node health (populated when also built and run with `--kube`).
 - **combined** — a split screen: topics on top, and the partitions of the topic you've drilled into on the bottom.
 
 Navigating and drilling in:
 
 - **↑/↓** (or `k`/`j`) move the cursor between topics.
-- **Enter** on the selected topic drills into it — switches to the combined view with that topic's partitions in the lower pane.
+- **Enter** on the selected topic drills into it — switches to the combined view with that topic's partitions in the lower pane. (This replaces a standalone partition list — drill into the topic you care about instead.)
 - **Esc** backs out of the drill-in to the topic view.
 - In the **kube** view, **Tab** switches the cursor between the pods and nodes sections; **Enter** opens detail for the selected pod (its resource breakdown and logs) or node (its capacity and which pods run on it). In pod-detail, the logs are a scannable one-line-per-entry list: **↑/↓** select a line, **Enter** expands it to a pretty-printed, wrapped view (timestamp, level, message, error, and the remaining fields) so you can read the whole thing — **Esc** collapses back, **w** toggles wrapping. The kube panel also shows a live log-stats summary (level counts, RSS trend, throughput, operational tallies, top messages).
 - **?** toggles a legend overlay explaining every status and trend.
 - **r** refreshes now, **q** (or Ctrl-C) quits.
 
-The refresh cadence uses `--watch-interval-secs`, and drain trend is derived from consecutive refreshes just like `--watch`. The kube view has data when the binary is also built with `--features kube` and run with `--kube`.
+The refresh cadence uses `--watch-interval-secs`, and drain trend is derived from consecutive refreshes just like `--watch`. Refreshing happens on a background thread, so switching views is instant and the fetch never freezes the UI — the screen always shows the most recent data and updates in place when the next refresh lands. The kube view has data when the binary is also built with `--features kube` and run with `--kube`.
 
 ## Kubernetes correlation (optional)
 
@@ -137,6 +136,8 @@ If a `--kube` run matches no pods, the tool helps you find the right target rath
 It renders a pod-summary section above the topic table (pod name, ready count, restarts, age, CPU and memory usage against limits, and state — with `OOMKilled`/`CrashLoopBackOff` highlighted), a node-capacity line per node the pods run on, flags a split rollout or large rollout skew, lists recent OOM/eviction events, prints any failed `--kube-assert` config checks, and scans the last N log lines per pod (`--kube-log-tail`, default 200) for ramp/OOM/error/config signals. CPU/MEM show `used/limit` coloured by percent of limit (green <70%, yellow 70–90%, red ≥90%); live usage needs metrics-server in the cluster, otherwise the used side shows `·`. Unhealthy topics also gain a short correlation hint in their `DETAIL` (e.g. `kube: 2 pod(s) OOM-killed`). In JSONL mode the full kube report is emitted as one extra line before the topic lines.
 
 If a pod's logs show a **transform / data-quality / DLQ error** — a DataFusion or SQL parse error, or rows being captured to a dead-letter queue — the tool treats it as a first-class problem, because it usually means *silent data loss*: rows are dropped to the DLQ while the pipeline still reports healthy and throughput looks normal. Affected pods show a red `DLQ-ERROR` state, a prominent alert banner appears under the pod table naming them, and the log summary tallies the error count. It's detected by stable substrings, so the specific failing SQL doesn't matter.
+
+The same escalation applies to the other signals that precede an outage but are easy to miss in a wall of logs — the transitions and thresholds, not just the raw numbers. A **pre-OOM memory warning** (RSS crossing the cgroup limit, "OOM kill imminent") shows a red `MEM-CRITICAL` pod state and a banner — caught *before* the kernel kills the pod, while it's still savable (it ranks above `OOMKilled`, which has already happened). A **throughput collapse** — a pod that was processing and dropped to zero, distinct from one idle since start — raises a banner. A **reconnect storm** (a burst of broker-closed/disconnect/TLS-EOF events over one window, not incidental churn) and **backpressure** (an internal channel near-full, which precedes a stall) are flagged and tallied. All are detected from the scanned pod logs and shown in both the plain output and the TUI kube panel.
 
 The Kubernetes side is strictly best-effort and isolated: if the cluster is unreachable or auth fails, the tool prints an `unreachable` notice and still renders the full Pulsar report. A consumer-side problem (failed pods, failed config assertion, split rollout) contributes to the non-zero exit code alongside topic health, so `--kube` works as a post-deploy gate.
 
