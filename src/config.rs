@@ -101,6 +101,42 @@ pub struct MetricsConfig {
     /// tuning (created if absent). Unset = summarise live but don't capture.
     #[serde(default)]
     pub capture_dir: Option<std::path::PathBuf>,
+    /// Metrics to monitor in the live summary. If any are listed here they
+    /// **replace** the built-in curated set; omit the list entirely to use the
+    /// built-in defaults. Each entry sets the metric name, its polarity, an
+    /// optional alert threshold, and an optional display label.
+    #[serde(default)]
+    pub watch: Vec<WatchMetric>,
+}
+
+/// One operator-chosen metric to monitor. `name` matches the Prometheus metric
+/// name (labelled series are aggregated). `polarity` says which direction is
+/// bad. `threshold`, if set, flags an alert when the value crosses it — above
+/// for `lower_better`, below for `higher_better`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchMetric {
+    pub name: String,
+    #[serde(default)]
+    pub polarity: MetricPolarity,
+    #[serde(default)]
+    pub threshold: Option<f64>,
+    /// Display name in the summary; defaults to `name` when unset.
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// Which direction of movement is bad for a metric.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricPolarity {
+    /// Lower values are healthier (lag, backlog, channel fill, memory ratio).
+    #[default]
+    LowerBetter,
+    /// Higher values are healthier (throughput, records written).
+    HigherBetter,
+    /// Neither — just report direction, never flag.
+    Neutral,
 }
 
 impl Default for MetricsConfig {
@@ -110,6 +146,7 @@ impl Default for MetricsConfig {
             port: default_metrics_port(),
             window: default_metrics_window(),
             capture_dir: None,
+            watch: Vec::new(),
         }
     }
 }
@@ -459,5 +496,50 @@ mod tests {
         assert_eq!(config.metrics.port, 9090);
         assert_eq!(config.metrics.window, 5);
         assert!(config.metrics.capture_dir.is_none());
+        assert!(config.metrics.watch.is_empty());
+    }
+
+    #[test]
+    fn parses_metrics_watch_list() {
+        let config: Config = toml::from_str(
+            r#"
+            subscription = "sub"
+            topics = ["a/b/c"]
+            [metrics]
+            enabled = true
+            [[metrics.watch]]
+            name = "ssync_pulsar_consumer_lag"
+            polarity = "lower_better"
+            threshold = 100000
+            label = "consumer lag"
+            [[metrics.watch]]
+            name = "ssync_throughput_rate"
+            polarity = "higher_better"
+            threshold = 50
+            "#,
+        )
+        .expect("watch list should parse");
+        assert_eq!(config.metrics.watch.len(), 2);
+        assert_eq!(config.metrics.watch[0].name, "ssync_pulsar_consumer_lag");
+        assert_eq!(config.metrics.watch[0].polarity, MetricPolarity::LowerBetter);
+        assert_eq!(config.metrics.watch[0].threshold, Some(100000.0));
+        assert_eq!(config.metrics.watch[0].label.as_deref(), Some("consumer lag"));
+        assert_eq!(config.metrics.watch[1].polarity, MetricPolarity::HigherBetter);
+        // label defaults to None (filled from name at use site).
+        assert!(config.metrics.watch[1].label.is_none());
+    }
+
+    #[test]
+    fn rejects_unknown_watch_field() {
+        let result: Result<Config, _> = toml::from_str(
+            r#"
+            subscription = "sub"
+            topics = ["a/b/c"]
+            [[metrics.watch]]
+            name = "m"
+            polarty = "lower_better"
+            "#,
+        );
+        assert!(result.is_err(), "typoed watch field must be rejected");
     }
 }

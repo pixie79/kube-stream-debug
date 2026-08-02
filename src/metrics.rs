@@ -224,6 +224,9 @@ pub struct MetricVerdict {
     pub worsening: bool,
     /// True when clearly improving.
     pub improving: bool,
+    /// True when an alert threshold was configured and the value has crossed it
+    /// in the bad direction (above for lower-better, below for higher-better).
+    pub breached: bool,
 }
 
 /// Whether a direction is "bad" given the metric's polarity.
@@ -239,6 +242,45 @@ fn is_improving(dir: Direction, pol: Polarity) -> bool {
         (dir, pol),
         (Direction::Down, Polarity::LowerBetter) | (Direction::Up, Polarity::HigherBetter)
     )
+}
+
+/// Whether a value has crossed its alert threshold in the bad direction: above
+/// for lower-better metrics, below for higher-better. No threshold, or neutral
+/// polarity, never breaches.
+fn threshold_breached(value: f64, threshold: Option<f64>, pol: Polarity) -> bool {
+    let Some(t) = threshold else {
+        return false;
+    };
+    match pol {
+        Polarity::LowerBetter => value > t,
+        Polarity::HigherBetter => value < t,
+        Polarity::Neutral => false,
+    }
+}
+
+/// A metric to monitor: name, a human label, its polarity, and an optional
+/// alert threshold. Produced either from the built-in curated defaults or from
+/// the operator's `[[metrics.watch]]` config.
+#[derive(Debug, Clone)]
+pub struct MetricSpec {
+    pub name: String,
+    pub label: String,
+    pub polarity: Polarity,
+    pub threshold: Option<f64>,
+}
+
+/// The built-in curated specs, used when the operator hasn't configured their
+/// own watch list.
+pub fn default_specs() -> Vec<MetricSpec> {
+    curated_series()
+        .iter()
+        .map(|(name, label, pol)| MetricSpec {
+            name: (*name).to_string(),
+            label: (*label).to_string(),
+            polarity: *pol,
+            threshold: None,
+        })
+        .collect()
 }
 
 /// The curated set of series to summarise, each with a human label and polarity.
@@ -287,30 +329,31 @@ fn aggregate_value(samples: &[Sample], name_prefix: &str) -> Option<f64> {
     }
 }
 
-/// Rolling per-pod metric history, keyed by curated metric name. Updated each
-/// scrape; produces the verdict list for the summary.
+/// Rolling per-pod metric history, keyed by watched metric name. Updated each
+/// scrape against a set of specs (operator-configured or the built-in default);
+/// produces the verdict list for the summary.
 #[derive(Debug, Default)]
 pub struct MetricHistory {
     series: BTreeMap<String, Series>,
 }
 
 impl MetricHistory {
-    /// Fold a fresh scrape in, updating each curated series' rolling history.
-    pub fn update(&mut self, samples: &[Sample], window: usize) {
-        for (name, _, _) in curated_series() {
-            if let Some(v) = aggregate_value(samples, name) {
-                self.series.entry((*name).to_string()).or_default().push(v, window);
+    /// Fold a fresh scrape in, updating each watched metric's rolling history.
+    pub fn update(&mut self, samples: &[Sample], specs: &[MetricSpec], window: usize) {
+        for spec in specs {
+            if let Some(v) = aggregate_value(samples, &spec.name) {
+                self.series.entry(spec.name.clone()).or_default().push(v, window);
             }
         }
     }
 
-    /// Produce a verdict per curated metric that has data, ordered worst-first
-    /// (worsening metrics before improving/flat) so the summary leads with the
-    /// problems.
-    pub fn verdicts(&self, eps: f64) -> Vec<MetricVerdict> {
+    /// Produce a verdict per watched metric that has data, ordered worst-first
+    /// (threshold breaches, then worsening, then flat, then improving) so the
+    /// summary leads with the problems.
+    pub fn verdicts(&self, specs: &[MetricSpec], eps: f64) -> Vec<MetricVerdict> {
         let mut out = Vec::new();
-        for (name, label, pol) in curated_series() {
-            let Some(series) = self.series.get(*name) else {
+        for spec in specs {
+            let Some(series) = self.series.get(&spec.name) else {
                 continue;
             };
             let Some(value) = series.current() else {
@@ -318,17 +361,29 @@ impl MetricHistory {
             };
             let instant = series.instant_direction(eps);
             let rolling = series.rolling_direction(eps);
-            // Use the rolling direction for the good/bad verdict (steadier).
+            let breached = threshold_breached(value, spec.threshold, spec.polarity);
             out.push(MetricVerdict {
-                label: (*label).to_string(),
+                label: spec.label.clone(),
                 value,
                 instant,
                 rolling,
-                worsening: is_worsening(rolling, *pol),
-                improving: is_improving(rolling, *pol),
+                worsening: is_worsening(rolling, spec.polarity),
+                improving: is_improving(rolling, spec.polarity),
+                breached,
             });
         }
-        out.sort_by_key(|v| if v.worsening { 0 } else if v.improving { 2 } else { 1 });
+        // Worst-first: a threshold breach outranks a mere worsening trend.
+        out.sort_by_key(|v| {
+            if v.breached {
+                0
+            } else if v.worsening {
+                1
+            } else if v.improving {
+                3
+            } else {
+                2
+            }
+        });
         out
     }
 }
@@ -344,7 +399,9 @@ pub fn format_summary(pod: &str, verdicts: &[MetricVerdict]) -> String {
             Direction::Down => "↓",
             Direction::Flat => "→",
         };
-        let mark = if v.worsening {
+        let mark = if v.breached {
+            " ‼"
+        } else if v.worsening {
             " ⚠"
         } else if v.improving {
             " ✓"
@@ -364,13 +421,23 @@ pub struct MetricsTracker {
     /// Per-pod rolling histories.
     per_pod: BTreeMap<String, MetricHistory>,
     window: usize,
+    /// The metrics to watch — operator-configured or the built-in default.
+    specs: Vec<MetricSpec>,
 }
 
 impl MetricsTracker {
-    pub fn new(window: usize) -> Self {
+    /// Build a tracker with an explicit set of specs. Pass `default_specs()` for
+    /// the built-in curated set, or specs derived from `[[metrics.watch]]`.
+    pub fn new(window: usize, specs: Vec<MetricSpec>) -> Self {
+        let specs = if specs.is_empty() {
+            default_specs()
+        } else {
+            specs
+        };
         MetricsTracker {
             per_pod: BTreeMap::new(),
             window: window.max(1),
+            specs,
         }
     }
 
@@ -379,8 +446,8 @@ impl MetricsTracker {
     pub fn observe(&mut self, pod: &str, metrics_text: &str, eps: f64) -> String {
         let samples = parse_prometheus(metrics_text);
         let hist = self.per_pod.entry(pod.to_string()).or_default();
-        hist.update(&samples, self.window);
-        let verdicts = hist.verdicts(eps);
+        hist.update(&samples, &self.specs, self.window);
+        let verdicts = hist.verdicts(&self.specs, eps);
         format_summary(pod, &verdicts)
     }
 
@@ -389,7 +456,7 @@ impl MetricsTracker {
     pub fn verdicts_for(&self, pod: &str, eps: f64) -> Vec<MetricVerdict> {
         self.per_pod
             .get(pod)
-            .map(|h| h.verdicts(eps))
+            .map(|h| h.verdicts(&self.specs, eps))
             .unwrap_or_default()
     }
 }
@@ -441,7 +508,7 @@ mod tests {
 
     #[test]
     fn tracker_accumulates_and_summarises() {
-        let mut t = MetricsTracker::new(5);
+        let mut t = MetricsTracker::new(5, default_specs());
         let scrape1 = "ssync_pulsar_consumer_lag 100\nssync_throughput_rate 50";
         let scrape2 = "ssync_pulsar_consumer_lag 200\nssync_throughput_rate 40";
         t.observe("pod-a", scrape1, 0.01);
@@ -546,21 +613,69 @@ ssync_pipeline_unhealthy 0";
     #[test]
     fn verdicts_flag_worsening_by_polarity() {
         let mut h = MetricHistory::default();
+        let specs = default_specs();
         // Lag climbing (LowerBetter) → worsening. Throughput climbing → improving.
         for (lag, tput) in [(100.0, 50.0), (200.0, 60.0), (300.0, 70.0)] {
             let samples = vec![
                 Sample { name: "ssync_pulsar_consumer_lag".into(), labels: vec![], value: lag },
                 Sample { name: "ssync_throughput_rate".into(), labels: vec![], value: tput },
             ];
-            h.update(&samples, 5);
+            h.update(&samples, &specs, 5);
         }
-        let v = h.verdicts(0.01);
+        let v = h.verdicts(&specs, 0.01);
         let lag = v.iter().find(|x| x.label == "consumer lag").unwrap();
         assert!(lag.worsening, "climbing lag should be worsening");
         let tput = v.iter().find(|x| x.label == "throughput rps").unwrap();
         assert!(tput.improving, "climbing throughput should be improving");
         // Worst-first ordering: the worsening metric sorts before the improving one.
         assert_eq!(v[0].label, "consumer lag");
+    }
+
+    #[test]
+    fn custom_specs_and_thresholds() {
+        // Operator watches one metric with a threshold; breach outranks trend.
+        let specs = vec![
+            MetricSpec {
+                name: "ssync_pulsar_consumer_lag".into(),
+                label: "lag".into(),
+                polarity: Polarity::LowerBetter,
+                threshold: Some(1000.0),
+            },
+            MetricSpec {
+                name: "ssync_throughput_rate".into(),
+                label: "tput".into(),
+                polarity: Polarity::HigherBetter,
+                threshold: Some(100.0),
+            },
+        ];
+        let mut h = MetricHistory::default();
+        // Lag under threshold, then over; throughput below its floor.
+        for (lag, tput) in [(500.0, 50.0), (1500.0, 40.0)] {
+            let samples = vec![
+                Sample { name: "ssync_pulsar_consumer_lag".into(), labels: vec![], value: lag },
+                Sample { name: "ssync_throughput_rate".into(), labels: vec![], value: tput },
+            ];
+            h.update(&samples, &specs, 5);
+        }
+        let v = h.verdicts(&specs, 0.01);
+        // Only the two configured metrics appear (not the whole curated set).
+        assert_eq!(v.len(), 2);
+        let lag = v.iter().find(|x| x.label == "lag").unwrap();
+        assert!(lag.breached, "lag 1500 > threshold 1000 should breach");
+        let tput = v.iter().find(|x| x.label == "tput").unwrap();
+        assert!(tput.breached, "throughput 40 < floor 100 should breach");
+    }
+
+    #[test]
+    fn threshold_breach_direction() {
+        // lower_better: breach when above.
+        assert!(threshold_breached(150.0, Some(100.0), Polarity::LowerBetter));
+        assert!(!threshold_breached(50.0, Some(100.0), Polarity::LowerBetter));
+        // higher_better: breach when below.
+        assert!(threshold_breached(40.0, Some(100.0), Polarity::HigherBetter));
+        assert!(!threshold_breached(150.0, Some(100.0), Polarity::HigherBetter));
+        // no threshold never breaches.
+        assert!(!threshold_breached(999.0, None, Polarity::LowerBetter));
     }
 
     #[test]
@@ -582,6 +697,7 @@ ssync_pipeline_unhealthy 0";
             rolling: Direction::Up,
             worsening: true,
             improving: false,
+            breached: false,
         }];
         let s = format_summary("pod-a", &verdicts);
         assert!(s.contains("metrics[pod-a]"));

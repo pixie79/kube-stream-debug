@@ -250,7 +250,8 @@ fn run_tui(
     // Inter-cycle drain: remember the previous cycle's backlogs, like watch mode.
     let mut prev: Option<(HashMap<String, i64>, std::time::Instant)> = None;
     let mut prev_state: HashMap<String, state::PriorState> = HashMap::new();
-    let mut metrics_tracker = metrics::MetricsTracker::new(metrics_config.window);
+    let mut metrics_tracker =
+        metrics::MetricsTracker::new(metrics_config.window, watch_specs(metrics_config));
 
     let refresh = move || {
         let now = std::time::Instant::now();
@@ -423,7 +424,8 @@ fn watch_loop(
     let interval = Duration::from_secs(cli.watch_interval_secs().max(1));
 
     // Rolling metrics tracker, persisted across cycles so trends accumulate.
-    let mut metrics_tracker = metrics::MetricsTracker::new(metrics_config.window);
+    let mut metrics_tracker =
+        metrics::MetricsTracker::new(metrics_config.window, watch_specs(metrics_config));
 
     // Previous cycle's per-topic backlog (keyed by topic name) and the instant
     // it was captured, so the next cycle can compute net drain over real
@@ -630,6 +632,26 @@ fn merge_kube_settings(
 /// Fetch the Kubernetes report if kube is active (via `--kube` or config).
 /// Feature-gated: without the `kube` feature this returns a helpful message so
 /// the flag isn't silently ignored.
+/// Convert the operator's `[[metrics.watch]]` config into the metrics module's
+/// specs. An empty list yields an empty vec; `MetricsTracker::new` then falls
+/// back to the built-in curated defaults.
+fn watch_specs(metrics_config: &config::MetricsConfig) -> Vec<metrics::MetricSpec> {
+    metrics_config
+        .watch
+        .iter()
+        .map(|w| metrics::MetricSpec {
+            name: w.name.clone(),
+            label: w.label.clone().unwrap_or_else(|| w.name.clone()),
+            polarity: match w.polarity {
+                config::MetricPolarity::LowerBetter => metrics::Polarity::LowerBetter,
+                config::MetricPolarity::HigherBetter => metrics::Polarity::HigherBetter,
+                config::MetricPolarity::Neutral => metrics::Polarity::Neutral,
+            },
+            threshold: w.threshold,
+        })
+        .collect()
+}
+
 /// Fold a fetched report's scraped pod metrics into the rolling tracker, log a
 /// curated per-pod summary line, and (if a capture dir is set) append every raw
 /// sample as a JSONL record for later tuning. Called once per refresh cycle;
