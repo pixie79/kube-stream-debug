@@ -12,6 +12,7 @@ mod cursor;
 mod drain;
 mod health;
 mod kube;
+mod metrics;
 mod output;
 mod pulsar;
 mod snapshot;
@@ -222,14 +223,15 @@ fn run() -> anyhow::Result<ExitCode> {
 
     let colors = config.colors;
     let kube_config = config.kube;
+    let metrics_config = config.metrics;
 
     if cli.tui {
-        return run_tui(&cli, &kube_config, &client, &topics, &subscription, threshold);
+        return run_tui(&cli, &kube_config, &metrics_config, &client, &topics, &subscription, threshold);
     }
     if cli.watch {
-        watch_loop(&cli, &colors, &kube_config, &client, &topics, &subscription, threshold)
+        watch_loop(&cli, &colors, &kube_config, &metrics_config, &client, &topics, &subscription, threshold)
     } else {
-        single_run(&cli, &colors, &kube_config, &client, &topics, &subscription, threshold)
+        single_run(&cli, &colors, &kube_config, &metrics_config, &client, &topics, &subscription, threshold)
     }
 }
 
@@ -237,6 +239,7 @@ fn run() -> anyhow::Result<ExitCode> {
 fn run_tui(
     cli: &Cli,
     kube_config: &config::KubeConfig,
+    metrics_config: &config::MetricsConfig,
     client: &AdminClient,
     topics: &[TopicName],
     subscription: &str,
@@ -247,6 +250,7 @@ fn run_tui(
     // Inter-cycle drain: remember the previous cycle's backlogs, like watch mode.
     let mut prev: Option<(HashMap<String, i64>, std::time::Instant)> = None;
     let mut prev_state: HashMap<String, state::PriorState> = HashMap::new();
+    let mut metrics_tracker = metrics::MetricsTracker::new(metrics_config.window);
 
     let refresh = move || {
         let now = std::time::Instant::now();
@@ -262,9 +266,17 @@ fn run_tui(
             results.iter().map(|h| (h.topic.clone(), h.backlog_or_zero())).collect();
         prev = Some((backlogs, now));
 
-        let kube = fetch_kube_report(cli, kube_config);
+        let kube = fetch_kube_report(cli, kube_config, metrics_config);
         if let Some(report) = &kube {
             annotate_with_kube(&mut results, report);
+            if metrics_config.enabled {
+                process_metrics(
+                    report,
+                    &mut metrics_tracker,
+                    metrics_config.capture_dir.as_deref(),
+                    &run_at,
+                );
+            }
         }
 
         // Persist the snapshot, same as watch mode — otherwise --json-dir is
@@ -295,6 +307,7 @@ fn single_run(
     cli: &Cli,
     colors: &config::ColorThresholds,
     kube_config: &config::KubeConfig,
+    metrics_config: &config::MetricsConfig,
     client: &AdminClient,
     topics: &[TopicName],
     subscription: &str,
@@ -306,7 +319,7 @@ fn single_run(
     // Kubernetes correlation (optional). Fetch this *before* the drain sample:
     // if --kube matched no pods, we're going to exit with discovery help
     // regardless, so there's no point waiting out the drain window first.
-    let kube_report = fetch_kube_report(cli, kube_config);
+    let kube_report = fetch_kube_report(cli, kube_config, metrics_config);
     if let Some(report) = &kube_report
         && let Some(discovery) = &report.discovery {
             eprintln!("kubernetes: namespace {}", report.namespace);
@@ -401,12 +414,16 @@ fn watch_loop(
     cli: &Cli,
     colors: &config::ColorThresholds,
     kube_config: &config::KubeConfig,
+    metrics_config: &config::MetricsConfig,
     client: &AdminClient,
     topics: &[TopicName],
     subscription: &str,
     threshold: i64,
 ) -> anyhow::Result<ExitCode> {
     let interval = Duration::from_secs(cli.watch_interval_secs().max(1));
+
+    // Rolling metrics tracker, persisted across cycles so trends accumulate.
+    let mut metrics_tracker = metrics::MetricsTracker::new(metrics_config.window);
 
     // Previous cycle's per-topic backlog (keyed by topic name) and the instant
     // it was captured, so the next cycle can compute net drain over real
@@ -440,9 +457,17 @@ fn watch_loop(
         prior_state = state::prior_from_results(&results);
 
         // Kubernetes correlation each cycle (optional).
-        let kube_report = fetch_kube_report(cli, kube_config);
+        let kube_report = fetch_kube_report(cli, kube_config, metrics_config);
         if let Some(report) = &kube_report {
             annotate_with_kube(&mut results, report);
+            if metrics_config.enabled {
+                process_metrics(
+                    report,
+                    &mut metrics_tracker,
+                    metrics_config.capture_dir.as_deref(),
+                    &run_at,
+                );
+            }
         }
 
         // Snapshot the full (unfiltered) results before any --problems-only trim.
@@ -605,8 +630,52 @@ fn merge_kube_settings(
 /// Fetch the Kubernetes report if kube is active (via `--kube` or config).
 /// Feature-gated: without the `kube` feature this returns a helpful message so
 /// the flag isn't silently ignored.
+/// Fold a fetched report's scraped pod metrics into the rolling tracker, log a
+/// curated per-pod summary line, and (if a capture dir is set) append every raw
+/// sample as a JSONL record for later tuning. Called once per refresh cycle;
+/// the tracker persists across cycles so trends accumulate.
+fn process_metrics(
+    report: &kube::KubeReport,
+    tracker: &mut metrics::MetricsTracker,
+    capture_dir: Option<&std::path::Path>,
+    run_at: &str,
+) {
+    const EPS: f64 = 0.02; // 2% change threshold for flat.
+    for pm in &report.pod_metrics {
+        let summary = tracker.observe(&pm.pod, &pm.metrics_text, EPS);
+        eprintln!("{summary}");
+        if let Some(dir) = capture_dir {
+            let samples = metrics::parse_prometheus(&pm.metrics_text);
+            let record = metrics::capture_record(run_at, &pm.pod, &samples);
+            if let Err(e) = append_capture(dir, &pm.pod, &record) {
+                eprintln!("Warning: metrics capture failed: {e}");
+            }
+        }
+    }
+}
+
+/// Append one JSONL record to `<dir>/metrics-<pod>.jsonl`, creating the dir.
+fn append_capture(dir: &std::path::Path, pod: &str, record: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    std::fs::create_dir_all(dir)?;
+    let safe: String = pod
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let path = dir.join(format!("metrics-{safe}.jsonl"));
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(file, "{record}")
+}
+
 #[cfg(feature = "kube")]
-fn fetch_kube_report(cli: &Cli, kube_config: &config::KubeConfig) -> Option<kube::KubeReport> {
+fn fetch_kube_report(
+    cli: &Cli,
+    kube_config: &config::KubeConfig,
+    metrics_config: &config::MetricsConfig,
+) -> Option<kube::KubeReport> {
     let resolved = resolve_kube(cli, kube_config)?;
     let Some(selector) = resolved.selector.clone() else {
         return Some(kube::KubeReport::unreachable(
@@ -622,6 +691,7 @@ fn fetch_kube_report(cli: &Cli, kube_config: &config::KubeConfig) -> Option<kube
         expected_config: resolved.assert.clone(),
         log_tail: (resolved.log_tail > 0).then_some(resolved.log_tail),
         event_window_secs: 30 * 60,
+        metrics_port: metrics_config.enabled.then_some(metrics_config.port),
     };
     // Small dedicated runtime: the rest of the tool is sync, so we don't want a
     // top-level async main. Block on the gather.
@@ -641,7 +711,11 @@ fn fetch_kube_report(cli: &Cli, kube_config: &config::KubeConfig) -> Option<kube
 }
 
 #[cfg(not(feature = "kube"))]
-fn fetch_kube_report(cli: &Cli, kube_config: &config::KubeConfig) -> Option<kube::KubeReport> {
+fn fetch_kube_report(
+    cli: &Cli,
+    kube_config: &config::KubeConfig,
+    _metrics_config: &config::MetricsConfig,
+) -> Option<kube::KubeReport> {
     if resolve_kube(cli, kube_config).is_some() {
         eprintln!(
             "Warning: Kubernetes correlation requires the tool to be built with `--features kube`; ignoring."

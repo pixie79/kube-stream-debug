@@ -1,0 +1,590 @@
+//! Pod metrics: parse the Prometheus `/metrics` text a stream-sync pod exposes,
+//! track a rolling per-metric history, compute trend (better/worse/flat plus
+//! rate-of-change for counters), and summarise the bottleneck-relevant subset.
+//!
+//! Everything here is pure and testable. The actual port-forward + HTTP scrape
+//! lives in `kube/client.rs` behind the `kube` feature; this module only turns
+//! scraped text into structured, trended, summarised data.
+
+use std::collections::BTreeMap;
+
+use serde::Serialize;
+
+/// One parsed metric sample: name, its labels, and the value. Prometheus lines
+/// look like `name{label="v",...} 12.3` (or `name 12.3` with no labels).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Sample {
+    pub name: String,
+    /// Sorted label key→value pairs (sorted so the series key is stable).
+    pub labels: Vec<(String, String)>,
+    pub value: f64,
+}
+
+impl Sample {
+    /// A stable identity for this series: `name{k="v",...}`. Used to line up the
+    /// same series across successive scrapes for trend computation.
+    pub fn series_key(&self) -> String {
+        if self.labels.is_empty() {
+            return self.name.clone();
+        }
+        let inner: Vec<String> = self
+            .labels
+            .iter()
+            .map(|(k, v)| format!("{k}=\"{v}\""))
+            .collect();
+        format!("{}{{{}}}", self.name, inner.join(","))
+    }
+}
+
+/// Parse Prometheus text-exposition format into samples. Skips `#` comment/HELP/
+/// TYPE lines and blank lines; tolerates malformed lines by skipping them (a
+/// pod's metrics endpoint should never take the whole scrape down).
+pub fn parse_prometheus(text: &str) -> Vec<Sample> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(sample) = parse_line(line) {
+            out.push(sample);
+        }
+    }
+    out
+}
+
+/// Parse a single non-comment metric line. Returns None on anything malformed.
+fn parse_line(line: &str) -> Option<Sample> {
+    // Split into "name{labels}" (or "name") and the value (last whitespace field).
+    // Prometheus allows an optional trailing timestamp; we take the first field
+    // after the series as the value and ignore any timestamp.
+    let (series, rest) = match line.find(' ') {
+        Some(idx) => (&line[..idx], line[idx..].trim()),
+        None => return None,
+    };
+    let value_str = rest.split_whitespace().next()?;
+    let value = parse_value(value_str)?;
+
+    let (name, labels) = if let Some(brace) = series.find('{') {
+        let name = &series[..brace];
+        let label_str = series.get(brace + 1..series.rfind('}')?)?;
+        (name.to_string(), parse_labels(label_str))
+    } else {
+        (series.to_string(), Vec::new())
+    };
+    if name.is_empty() {
+        return None;
+    }
+    Some(Sample { name, labels, value })
+}
+
+/// Prometheus values are f64; `+Inf`/`-Inf`/`NaN` are valid.
+fn parse_value(s: &str) -> Option<f64> {
+    match s {
+        "+Inf" => Some(f64::INFINITY),
+        "-Inf" => Some(f64::NEG_INFINITY),
+        "NaN" => Some(f64::NAN),
+        other => other.parse::<f64>().ok(),
+    }
+}
+
+/// Parse `k1="v1",k2="v2"` into sorted (key, value) pairs. Values are quoted;
+/// commas inside values aren't expected for these metrics, so a simple split is
+/// sufficient and robust enough.
+fn parse_labels(s: &str) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for part in s.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = part.split_once('=') {
+            let v = v.trim().trim_matches('"');
+            pairs.push((k.trim().to_string(), v.to_string()));
+        }
+    }
+    pairs.sort();
+    pairs
+}
+
+/// Direction of a metric between two points in time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Direction {
+    Up,
+    Down,
+    Flat,
+}
+
+/// Whether a direction is good, bad, or neutral depends on the metric — lag
+/// going up is bad, throughput going up is good. Callers pass the polarity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Polarity {
+    /// Higher is better (throughput, records written).
+    HigherBetter,
+    /// Lower is better (lag, backlog, channel fill, memory ratio).
+    LowerBetter,
+    /// Neither — just report the direction.
+    Neutral,
+}
+
+/// A per-series rolling history, capped to a window. Feeds trend computation.
+#[derive(Debug, Clone, Default)]
+pub struct Series {
+    /// Most recent values, oldest first, capped to the window length.
+    values: Vec<f64>,
+}
+
+impl Series {
+    pub fn push(&mut self, value: f64, window: usize) {
+        self.values.push(value);
+        let window = window.max(1);
+        if self.values.len() > window {
+            let excess = self.values.len() - window;
+            self.values.drain(0..excess);
+        }
+    }
+
+    pub fn current(&self) -> Option<f64> {
+        self.values.last().copied()
+    }
+
+    pub fn previous(&self) -> Option<f64> {
+        if self.values.len() >= 2 {
+            Some(self.values[self.values.len() - 2])
+        } else {
+            None
+        }
+    }
+
+    /// Instantaneous direction: current vs the immediately preceding sample.
+    /// `eps` is the fraction of the previous value under which a change reads as
+    /// flat, so noise doesn't flap the trend.
+    pub fn instant_direction(&self, eps: f64) -> Direction {
+        match (self.current(), self.previous()) {
+            (Some(cur), Some(prev)) => classify(prev, cur, eps),
+            _ => Direction::Flat,
+        }
+    }
+
+    /// Rolling direction across the whole window: compares the mean of the older
+    /// half to the mean of the newer half, so a single spike doesn't dominate.
+    pub fn rolling_direction(&self, eps: f64) -> Direction {
+        let n = self.values.len();
+        if n < 2 {
+            return Direction::Flat;
+        }
+        let mid = n / 2;
+        let older = mean(&self.values[..mid.max(1)]);
+        let newer = mean(&self.values[mid..]);
+        classify(older, newer, eps)
+    }
+
+    /// Rate of change per sample for a counter (current minus previous). Returns
+    /// None if fewer than two samples, or if the counter reset (went down).
+    pub fn counter_rate(&self) -> Option<f64> {
+        match (self.current(), self.previous()) {
+            (Some(cur), Some(prev)) if cur >= prev => Some(cur - prev),
+            _ => None,
+        }
+    }
+}
+
+fn mean(xs: &[f64]) -> f64 {
+    if xs.is_empty() {
+        return 0.0;
+    }
+    xs.iter().sum::<f64>() / xs.len() as f64
+}
+
+/// Classify a change from `prev` to `cur` as Up/Down/Flat, treating a change
+/// smaller than `eps` fraction of `prev` (or an absolute floor) as Flat.
+fn classify(prev: f64, cur: f64, eps: f64) -> Direction {
+    let delta = cur - prev;
+    let threshold = (prev.abs() * eps).max(1e-9);
+    if delta > threshold {
+        Direction::Up
+    } else if delta < -threshold {
+        Direction::Down
+    } else {
+        Direction::Flat
+    }
+}
+
+/// Verdict for one summarised metric: its value, both trend readings, and
+/// whether the movement is good or bad given the metric's polarity.
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricVerdict {
+    pub label: String,
+    pub value: f64,
+    pub instant: Direction,
+    pub rolling: Direction,
+    /// True when the movement is in the bad direction for this metric.
+    pub worsening: bool,
+    /// True when clearly improving.
+    pub improving: bool,
+}
+
+/// Whether a direction is "bad" given the metric's polarity.
+fn is_worsening(dir: Direction, pol: Polarity) -> bool {
+    matches!(
+        (dir, pol),
+        (Direction::Up, Polarity::LowerBetter) | (Direction::Down, Polarity::HigherBetter)
+    )
+}
+
+fn is_improving(dir: Direction, pol: Polarity) -> bool {
+    matches!(
+        (dir, pol),
+        (Direction::Down, Polarity::LowerBetter) | (Direction::Up, Polarity::HigherBetter)
+    )
+}
+
+/// The curated set of series to summarise, each with a human label and polarity.
+/// Names are matched by prefix so a labelled series (e.g. per-topic lag)
+/// aggregates under one entry. This is the "consumer health / sync health /
+/// throughput / bottleneck" view over the ~200 exposed metrics.
+pub fn curated_series() -> &'static [(&'static str, &'static str, Polarity)] {
+    &[
+        // Consumer health.
+        ("ssync_pulsar_consumer_lag", "consumer lag", Polarity::LowerBetter),
+        ("ssync_pulsar_backlog_bytes", "backlog bytes", Polarity::LowerBetter),
+        ("ssync_pulsar_unacked_messages", "unacked", Polarity::LowerBetter),
+        ("ssync_pulsar_reconnections", "reconnections", Polarity::LowerBetter),
+        ("ssync_source_partitions_idle", "idle partitions", Polarity::LowerBetter),
+        // Throughput (per stage).
+        ("ssync_throughput_rate", "throughput rps", Polarity::HigherBetter),
+        ("ssync_source_records_consumed_total", "consumed", Polarity::HigherBetter),
+        ("ssync_records_written_total", "written", Polarity::HigherBetter),
+        ("ssync_sink_records_sent_total", "sink sent", Polarity::HigherBetter),
+        // Bottleneck detection — channel depths/fill.
+        ("ssync_source_channel_fill_ratio", "source chan fill", Polarity::LowerBetter),
+        ("ssync_decoded_channel_depth", "decoded chan depth", Polarity::LowerBetter),
+        ("ssync_batcher_channel_depth", "batcher chan depth", Polarity::LowerBetter),
+        ("ssync_writer_channel_fill_ratio", "writer chan fill", Polarity::LowerBetter),
+        // Health / pressure.
+        ("ssync_backpressure_state", "backpressure", Polarity::LowerBetter),
+        ("ssync_memory_rss_ratio", "mem rss ratio", Polarity::LowerBetter),
+        ("ssync_pipeline_unhealthy", "unhealthy", Polarity::LowerBetter),
+        ("ssync_destination_dlq_rows_total", "dlq rows", Polarity::LowerBetter),
+    ]
+}
+
+/// Aggregate the current value of a metric across all its label series (e.g.
+/// per-topic lag summed). For gauges that's a sum; good enough for a headline.
+fn aggregate_value(samples: &[Sample], name_prefix: &str) -> Option<f64> {
+    let matching: Vec<f64> = samples
+        .iter()
+        .filter(|s| s.name == name_prefix)
+        .map(|s| s.value)
+        .filter(|v| v.is_finite())
+        .collect();
+    if matching.is_empty() {
+        None
+    } else {
+        Some(matching.iter().sum())
+    }
+}
+
+/// Rolling per-pod metric history, keyed by curated metric name. Updated each
+/// scrape; produces the verdict list for the summary.
+#[derive(Debug, Default)]
+pub struct MetricHistory {
+    series: BTreeMap<String, Series>,
+}
+
+impl MetricHistory {
+    /// Fold a fresh scrape in, updating each curated series' rolling history.
+    pub fn update(&mut self, samples: &[Sample], window: usize) {
+        for (name, _, _) in curated_series() {
+            if let Some(v) = aggregate_value(samples, name) {
+                self.series.entry((*name).to_string()).or_default().push(v, window);
+            }
+        }
+    }
+
+    /// Produce a verdict per curated metric that has data, ordered worst-first
+    /// (worsening metrics before improving/flat) so the summary leads with the
+    /// problems.
+    pub fn verdicts(&self, eps: f64) -> Vec<MetricVerdict> {
+        let mut out = Vec::new();
+        for (name, label, pol) in curated_series() {
+            let Some(series) = self.series.get(*name) else {
+                continue;
+            };
+            let Some(value) = series.current() else {
+                continue;
+            };
+            let instant = series.instant_direction(eps);
+            let rolling = series.rolling_direction(eps);
+            // Use the rolling direction for the good/bad verdict (steadier).
+            out.push(MetricVerdict {
+                label: (*label).to_string(),
+                value,
+                instant,
+                rolling,
+                worsening: is_worsening(rolling, *pol),
+                improving: is_improving(rolling, *pol),
+            });
+        }
+        out.sort_by_key(|v| if v.worsening { 0 } else if v.improving { 2 } else { 1 });
+        out
+    }
+}
+
+/// A one-line-per-metric summary string for logging (per pod, per minute).
+pub fn format_summary(pod: &str, verdicts: &[MetricVerdict]) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = write!(out, "metrics[{pod}]:");
+    for v in verdicts {
+        let arrow = match v.rolling {
+            Direction::Up => "↑",
+            Direction::Down => "↓",
+            Direction::Flat => "→",
+        };
+        let mark = if v.worsening {
+            " ⚠"
+        } else if v.improving {
+            " ✓"
+        } else {
+            ""
+        };
+        let _ = write!(out, " {}={:.0}{arrow}{mark}", v.label, v.value);
+    }
+    out
+}
+
+/// Tracks rolling metric history across scrapes for every pod, produces the
+/// per-pod summary lines, and (optionally) captures raw scraped metrics to disk
+/// as JSONL for later tuning. Lives across refresh cycles so trends accumulate.
+#[derive(Debug, Default)]
+pub struct MetricsTracker {
+    /// Per-pod rolling histories.
+    per_pod: BTreeMap<String, MetricHistory>,
+    window: usize,
+}
+
+impl MetricsTracker {
+    pub fn new(window: usize) -> Self {
+        MetricsTracker {
+            per_pod: BTreeMap::new(),
+            window: window.max(1),
+        }
+    }
+
+    /// Fold one pod's freshly-scraped Prometheus text into its history and
+    /// return the summary line for logging. `eps` is the flat-threshold.
+    pub fn observe(&mut self, pod: &str, metrics_text: &str, eps: f64) -> String {
+        let samples = parse_prometheus(metrics_text);
+        let hist = self.per_pod.entry(pod.to_string()).or_default();
+        hist.update(&samples, self.window);
+        let verdicts = hist.verdicts(eps);
+        format_summary(pod, &verdicts)
+    }
+
+    /// Verdicts for a pod, for a caller that wants to render them (TUI) rather
+    /// than the formatted string.
+    pub fn verdicts_for(&self, pod: &str, eps: f64) -> Vec<MetricVerdict> {
+        self.per_pod
+            .get(pod)
+            .map(|h| h.verdicts(eps))
+            .unwrap_or_default()
+    }
+}
+
+/// Build one JSONL record capturing every scraped sample for a pod at a moment,
+/// for offline tuning. Shape: `{"as_of":..,"pod":..,"metrics":{series_key:val}}`.
+/// Pure (returns the string); the caller appends it to the capture file.
+pub fn capture_record(as_of: &str, pod: &str, samples: &[Sample]) -> String {
+    let map: BTreeMap<String, f64> = samples
+        .iter()
+        .filter(|s| s.value.is_finite())
+        .map(|s| (s.series_key(), s.value))
+        .collect();
+    // Hand-build to avoid pulling serde_json structures for one line; values are
+    // plain floats and keys are already-escaped-enough metric identifiers.
+    let mut parts: Vec<String> = Vec::with_capacity(map.len());
+    for (k, v) in &map {
+        parts.push(format!("{}:{}", json_string(k), v));
+    }
+    format!(
+        "{{\"as_of\":{},\"pod\":{},\"metrics\":{{{}}}}}",
+        json_string(as_of),
+        json_string(pod),
+        parts.join(",")
+    )
+}
+
+/// Minimal JSON string escaping for the capture record.
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tracker_accumulates_and_summarises() {
+        let mut t = MetricsTracker::new(5);
+        let scrape1 = "ssync_pulsar_consumer_lag 100\nssync_throughput_rate 50";
+        let scrape2 = "ssync_pulsar_consumer_lag 200\nssync_throughput_rate 40";
+        t.observe("pod-a", scrape1, 0.01);
+        let line = t.observe("pod-a", scrape2, 0.01);
+        // Lag rose (bad), throughput fell (bad) → both flagged.
+        assert!(line.contains("metrics[pod-a]"));
+        assert!(line.contains("consumer lag=200"));
+        let verdicts = t.verdicts_for("pod-a", 0.01);
+        let lag = verdicts.iter().find(|v| v.label == "consumer lag").unwrap();
+        assert!(lag.worsening);
+    }
+
+    #[test]
+    fn capture_record_is_valid_jsonish() {
+        let samples = vec![
+            Sample { name: "m".into(), labels: vec![("t".into(), "x".into())], value: 1.5 },
+            Sample { name: "n".into(), labels: vec![], value: 2.0 },
+        ];
+        let rec = capture_record("2026-07-31T00:00:00Z", "pod-a", &samples);
+        assert!(rec.starts_with("{\"as_of\":\"2026-07-31T00:00:00Z\",\"pod\":\"pod-a\""));
+        assert!(rec.contains("\"m{t=\\\"x\\\"}\":1.5"));
+        assert!(rec.contains("\"n\":2"));
+    }
+
+    #[test]
+    fn parses_labeled_and_bare_lines() {
+        let text = "\
+# HELP ssync_throughput_rate rps
+# TYPE ssync_throughput_rate gauge
+ssync_throughput_rate 230.5
+ssync_pulsar_consumer_lag{topic=\"a\",partition=\"0\"} 1200
+ssync_pulsar_consumer_lag{topic=\"a\",partition=\"1\"} 800
+
+malformed line with no value structure that still has spaces
+ssync_pipeline_unhealthy 0";
+        let samples = parse_prometheus(text);
+        // 4 valid samples (the "malformed" line actually parses name=malformed,
+        // value=line? no — "malformed" then "line" isn't a float, so skipped).
+        let rate = samples.iter().find(|s| s.name == "ssync_throughput_rate").unwrap();
+        assert_eq!(rate.value, 230.5);
+        assert!(rate.labels.is_empty());
+        let lag: Vec<&Sample> = samples.iter().filter(|s| s.name == "ssync_pulsar_consumer_lag").collect();
+        assert_eq!(lag.len(), 2);
+        // Labels are sorted.
+        assert_eq!(lag[0].labels[0].0, "partition");
+        assert_eq!(lag[0].labels[1].0, "topic");
+    }
+
+    #[test]
+    fn series_key_is_stable() {
+        let s = Sample {
+            name: "m".into(),
+            labels: vec![("b".into(), "2".into()), ("a".into(), "1".into())],
+            value: 1.0,
+        };
+        // labels already sorted by parse, but construct here unsorted to confirm
+        // the key format; sort manually as parse would.
+        let mut s2 = s.clone();
+        s2.labels.sort();
+        assert_eq!(s2.series_key(), "m{a=\"1\",b=\"2\"}");
+    }
+
+    #[test]
+    fn instant_and_rolling_direction() {
+        let mut s = Series::default();
+        for v in [100.0, 110.0, 120.0, 130.0] {
+            s.push(v, 10);
+        }
+        assert_eq!(s.instant_direction(0.01), Direction::Up);
+        assert_eq!(s.rolling_direction(0.01), Direction::Up);
+        assert_eq!(s.current(), Some(130.0));
+
+        // A tiny wobble reads as flat.
+        let mut f = Series::default();
+        f.push(1000.0, 10);
+        f.push(1002.0, 10); // 0.2% < 1% eps
+        assert_eq!(f.instant_direction(0.01), Direction::Flat);
+    }
+
+    #[test]
+    fn window_caps_history() {
+        let mut s = Series::default();
+        for v in 0..10 {
+            s.push(v as f64, 3);
+        }
+        // Only the last 3 kept.
+        assert_eq!(s.current(), Some(9.0));
+        assert_eq!(s.previous(), Some(8.0));
+    }
+
+    #[test]
+    fn counter_rate_and_reset() {
+        let mut s = Series::default();
+        s.push(100.0, 5);
+        s.push(150.0, 5);
+        assert_eq!(s.counter_rate(), Some(50.0));
+        // Reset (counter went down) → None.
+        s.push(10.0, 5);
+        assert_eq!(s.counter_rate(), None);
+    }
+
+    #[test]
+    fn verdicts_flag_worsening_by_polarity() {
+        let mut h = MetricHistory::default();
+        // Lag climbing (LowerBetter) → worsening. Throughput climbing → improving.
+        for (lag, tput) in [(100.0, 50.0), (200.0, 60.0), (300.0, 70.0)] {
+            let samples = vec![
+                Sample { name: "ssync_pulsar_consumer_lag".into(), labels: vec![], value: lag },
+                Sample { name: "ssync_throughput_rate".into(), labels: vec![], value: tput },
+            ];
+            h.update(&samples, 5);
+        }
+        let v = h.verdicts(0.01);
+        let lag = v.iter().find(|x| x.label == "consumer lag").unwrap();
+        assert!(lag.worsening, "climbing lag should be worsening");
+        let tput = v.iter().find(|x| x.label == "throughput rps").unwrap();
+        assert!(tput.improving, "climbing throughput should be improving");
+        // Worst-first ordering: the worsening metric sorts before the improving one.
+        assert_eq!(v[0].label, "consumer lag");
+    }
+
+    #[test]
+    fn aggregates_labeled_series() {
+        // Per-partition lag sums into one headline value.
+        let samples = vec![
+            Sample { name: "ssync_pulsar_consumer_lag".into(), labels: vec![("partition".into(), "0".into())], value: 1200.0 },
+            Sample { name: "ssync_pulsar_consumer_lag".into(), labels: vec![("partition".into(), "1".into())], value: 800.0 },
+        ];
+        assert_eq!(aggregate_value(&samples, "ssync_pulsar_consumer_lag"), Some(2000.0));
+    }
+
+    #[test]
+    fn summary_formats_with_arrows() {
+        let verdicts = vec![MetricVerdict {
+            label: "consumer lag".into(),
+            value: 2000.0,
+            instant: Direction::Up,
+            rolling: Direction::Up,
+            worsening: true,
+            improving: false,
+        }];
+        let s = format_summary("pod-a", &verdicts);
+        assert!(s.contains("metrics[pod-a]"));
+        assert!(s.contains("consumer lag=2000↑ ⚠"));
+    }
+}

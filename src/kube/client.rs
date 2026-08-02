@@ -39,6 +39,8 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::api::{Api, ListParams, LogParams};
 use kube::Client;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
 use super::{ConfigAssertion, KubeEvent, KubeReport, PodSummary};
 
 /// Options controlling what the client gathers.
@@ -54,6 +56,8 @@ pub struct KubeQuery {
     pub log_tail: Option<i64>,
     /// Only consider events newer than this many seconds.
     pub event_window_secs: i64,
+    /// Pod metrics port to scrape (None = skip metrics scraping).
+    pub metrics_port: Option<u16>,
 }
 
 /// Gather the full Kubernetes report. Never returns Err — on a connection or
@@ -159,6 +163,11 @@ pub async fn gather(query: &KubeQuery) -> KubeReport {
         report.pod_logs = per_pod;
     }
 
+    // Metrics scrape (best-effort, only when a port is configured).
+    if let Some(port) = query.metrics_port {
+        report.pod_metrics = scrape_pod_metrics(&pods, &report.pods, port).await;
+    }
+
     // Live CPU/memory from the metrics API (metrics.k8s.io), best-effort — it's
     // only present if metrics-server is installed. Fills used_* on each pod.
     gather_pod_metrics(&client, &query.namespace, &mut report.pods).await;
@@ -226,6 +235,72 @@ async fn gather_pod_metrics(client: &Client, namespace: &str, pods: &mut [PodSum
 }
 
 /// Fetch capacity for the distinct nodes the pods run on. Best-effort.
+/// Port-forward to a pod's metrics port and GET a path (`/metrics` or
+/// `/health`), returning the response body. Best-effort: any failure yields
+/// None so a scrape problem never breaks the rest of the report. Uses kube-rs's
+/// in-process port-forward (no `kubectl` dependency).
+///
+/// ## Compilation note
+/// This uses `Api::<Pod>::portforward(name, &[port])` → `Portforwarder`, then
+/// `take_stream(port)` for a duplex `AsyncRead + AsyncWrite` to the pod port,
+/// over which we do a minimal HTTP/1.0 GET. API shapes are kube 0.99; if the
+/// build fails here the likely spots are `portforward`'s return type and
+/// `take_stream` (some versions expose `ports()` returning a map instead).
+async fn portforward_get(
+    pods: &Api<Pod>,
+    pod: &str,
+    port: u16,
+    path: &str,
+) -> Option<String> {
+    let mut pf = pods.portforward(pod, &[port]).await.ok()?;
+    let mut stream = pf.take_stream(port)?;
+
+    // Minimal HTTP/1.0 request; Connection: close so the server ends the body.
+    let req = format!(
+        "GET {path} HTTP/1.0\r\nHost: localhost\r\nAccept: text/plain\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).await.ok()?;
+    stream.flush().await.ok()?;
+
+    let mut buf = Vec::new();
+    // Cap the read so a huge/hostile response can't balloon memory.
+    let mut limited = (&mut stream).take(4 * 1024 * 1024);
+    limited.read_to_end(&mut buf).await.ok()?;
+
+    let text = String::from_utf8_lossy(&buf);
+    // Split headers from body at the blank line.
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_else(|| text.to_string());
+    Some(body)
+}
+
+/// Scrape `/metrics` and `/health` for each pod (best-effort, in parallel),
+/// returning a `PodMetrics` per reachable pod. Non-reachable pods are omitted.
+async fn scrape_pod_metrics(
+    pods: &Api<Pod>,
+    summaries: &[PodSummary],
+    port: u16,
+) -> Vec<super::PodMetrics> {
+    let futures = summaries.iter().map(|p| async move {
+        let metrics_text = portforward_get(pods, &p.name, port, "/metrics").await?;
+        let health = portforward_get(pods, &p.name, port, "/health")
+            .await
+            .map(|b| b.trim().to_string());
+        Some(super::PodMetrics {
+            pod: p.name.clone(),
+            metrics_text,
+            health,
+        })
+    });
+    futures::future::join_all(futures)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
 async fn gather_nodes(client: &Client, pods: &[PodSummary]) -> Vec<super::NodeInfo> {
     use k8s_openapi::api::core::v1::Node;
 

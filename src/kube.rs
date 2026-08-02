@@ -185,6 +185,16 @@ pub struct LogStats {
     pub throughput_collapsed: bool,
 }
 
+/// Raw scraped metrics for one pod: the Prometheus `/metrics` text and the
+/// `/health` body. Parsed and trended by the `metrics` module.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct PodMetrics {
+    pub pod: String,
+    pub metrics_text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health: Option<String>,
+}
+
 /// Raw recent log lines for one pod, retained for the node-detail view.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct PodLogs {
@@ -209,6 +219,10 @@ pub struct KubeReport {
     /// Raw recent logs per pod, for the node-detail drill-down.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub pod_logs: Vec<PodLogs>,
+    /// Scraped per-pod metrics (Prometheus text + health), when metrics scraping
+    /// is enabled. Empty otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pod_metrics: Vec<PodMetrics>,
     /// Distinct images across pods; more than one means a split rollout.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,

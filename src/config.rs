@@ -73,6 +73,53 @@ pub struct Config {
     /// …). Every field is optional; a CLI flag overrides the config value.
     #[serde(default)]
     pub settings: Settings,
+
+    /// Optional pod-metrics scraping (port-forward to each pod's /metrics and
+    /// /health, summarise trends, capture raw for tuning). Off unless enabled.
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+}
+
+/// Pod-metrics scraping settings. When `enabled`, and `--kube` is active, the
+/// tool port-forwards to each consumer pod's metrics port, parses the Prometheus
+/// text, tracks per-metric rolling trends, logs a curated per-pod summary each
+/// interval, and (optionally) writes every scraped metric to disk for later
+/// tuning analysis.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsConfig {
+    /// Enable metrics scraping (requires `--kube` / kube feature).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Pod port that serves `/metrics` and `/health` (default 9090).
+    #[serde(default = "default_metrics_port")]
+    pub port: u16,
+    /// Rolling-trend window: how many scrapes to keep per metric (default 5).
+    #[serde(default = "default_metrics_window")]
+    pub window: usize,
+    /// Directory to write raw per-pod, per-scrape metrics as JSONL for later
+    /// tuning (created if absent). Unset = summarise live but don't capture.
+    #[serde(default)]
+    pub capture_dir: Option<std::path::PathBuf>,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        MetricsConfig {
+            enabled: false,
+            port: default_metrics_port(),
+            window: default_metrics_window(),
+            capture_dir: None,
+        }
+    }
+}
+
+fn default_metrics_port() -> u16 {
+    9090
+}
+
+fn default_metrics_window() -> usize {
+    5
 }
 
 /// Operational defaults settable in the config `[settings]` table, so a
@@ -377,5 +424,40 @@ mod tests {
             "#,
         );
         assert!(result.is_err(), "typoed settings field must be rejected");
+    }
+
+    #[test]
+    fn parses_metrics_section() {
+        let config: Config = toml::from_str(
+            r#"
+            subscription = "sub"
+            topics = ["a/b/c"]
+            [metrics]
+            enabled = true
+            port = 9000
+            window = 10
+            capture_dir = "./metrics-capture"
+            "#,
+        )
+        .expect("metrics section should parse");
+        assert!(config.metrics.enabled);
+        assert_eq!(config.metrics.port, 9000);
+        assert_eq!(config.metrics.window, 10);
+        assert_eq!(config.metrics.capture_dir.as_deref(), Some(std::path::Path::new("./metrics-capture")));
+    }
+
+    #[test]
+    fn metrics_section_defaults() {
+        let config: Config = toml::from_str(
+            r#"
+            subscription = "sub"
+            topics = ["a/b/c"]
+            "#,
+        )
+        .unwrap();
+        assert!(!config.metrics.enabled);
+        assert_eq!(config.metrics.port, 9090);
+        assert_eq!(config.metrics.window, 5);
+        assert!(config.metrics.capture_dir.is_none());
     }
 }
