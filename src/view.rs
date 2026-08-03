@@ -89,6 +89,8 @@ pub struct ViewState {
     /// In pod-detail, whether the bottom pane shows this pod's metrics (true) or
     /// its logs (false). Toggled with `m`.
     pub pod_detail_metrics: bool,
+    /// Vertical scroll offset (in lines) for the fleet metrics view.
+    pub metrics_scroll: u16,
     /// When set, the node-detail view is showing this node.
     pub selected_node: Option<String>,
     /// Whether the status-legend help overlay is showing.
@@ -107,6 +109,7 @@ impl Default for ViewState {
             log_expanded: false,
             log_wrap: true,
             pod_detail_metrics: false,
+            metrics_scroll: 0,
             selected_node: None,
             show_help: false,
         }
@@ -117,6 +120,17 @@ impl ViewState {
     pub fn cycle_view(&mut self) {
         self.view = self.view.next();
         self.cursor = 0;
+        self.metrics_scroll = 0;
+    }
+
+    /// Scroll the fleet metrics view down by `n` lines (saturating).
+    pub fn metrics_scroll_down(&mut self, n: u16) {
+        self.metrics_scroll = self.metrics_scroll.saturating_add(n);
+    }
+
+    /// Scroll the fleet metrics view up by `n` lines (saturating at 0).
+    pub fn metrics_scroll_up(&mut self, n: u16) {
+        self.metrics_scroll = self.metrics_scroll.saturating_sub(n);
     }
 
     /// Move the cursor down, clamped to `len-1`. No-op on an empty set.

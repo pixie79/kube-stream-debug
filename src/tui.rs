@@ -160,6 +160,8 @@ fn ui_loop(
                     KeyCode::Up | KeyCode::Char('k') => {
                         if state.view == View::PodDetail {
                             state.log_cursor_up();
+                        } else if state.view == View::Metrics {
+                            state.metrics_scroll_up(1);
                         } else {
                             state.cursor_up();
                         }
@@ -167,10 +169,14 @@ fn ui_loop(
                     KeyCode::Down | KeyCode::Char('j') => {
                         if state.view == View::PodDetail {
                             state.log_cursor_down(log_len);
+                        } else if state.view == View::Metrics {
+                            state.metrics_scroll_down(1);
                         } else {
                             state.cursor_down(cursor_len);
                         }
                     }
+                    KeyCode::PageUp if state.view == View::Metrics => state.metrics_scroll_up(10),
+                    KeyCode::PageDown if state.view == View::Metrics => state.metrics_scroll_down(10),
                     KeyCode::Enter => match state.view {
                         View::Kube => state.kube_drill_in(&pod_names, &node_names),
                         View::PodDetail => state.log_expand(),
@@ -229,7 +235,7 @@ fn draw(f: &mut ratatui::Frame, state: &ViewState, frame: &Frame) {
     match state.view {
         View::Topic => draw_topics(f, chunks[1], state, frame),
         View::Kube => draw_kube(f, chunks[1], state, frame),
-        View::Metrics => draw_metrics(f, chunks[1], frame),
+        View::Metrics => draw_metrics(f, chunks[1], frame, state.metrics_scroll),
         View::Combined => draw_combined(f, chunks[1], state, frame),
         View::PodDetail => draw_pod_detail(f, chunks[1], state, frame),
         View::NodeDetail => draw_node_detail(f, chunks[1], state, frame),
@@ -239,7 +245,7 @@ fn draw(f: &mut ratatui::Frame, state: &ViewState, frame: &Frame) {
         View::Kube => " ↑/↓=move  Tab=pods/nodes  Enter=open  Esc=back  v=view  ?=legend  q=quit",
         View::PodDetail => " ↑/↓=select  Enter=expand  Esc=collapse/back  m=logs/metrics  w=wrap  q=quit",
         View::NodeDetail => " Esc=back  ?=legend  r=refresh  q=quit",
-        View::Metrics => " v=view  r=refresh  q=quit  (fleet metrics — breaches red, worsening yellow)",
+        View::Metrics => " ↑/↓ PgUp/PgDn=scroll  v=view  r=refresh  q=quit",
         _ => " ↑/↓=move  Enter=drill in  Esc=back  v=view  ?=legend  r=refresh  q=quit",
     };
     f.render_widget(Paragraph::new(help), chunks[2]);
@@ -290,7 +296,7 @@ fn metric_line_spans(line: &crate::kube::MetricLine) -> Vec<Span<'static>> {
 /// (consumer / throughput / bottleneck / health). Pods with a breach are listed
 /// first within each group. This is the "where's the problem across the fleet"
 /// view.
-fn draw_metrics(f: &mut ratatui::Frame, area: Rect, frame: &Frame) {
+fn draw_metrics(f: &mut ratatui::Frame, area: Rect, frame: &Frame, scroll: u16) {
     let block = Block::default().borders(Borders::ALL).title("fleet metrics");
     let Some(report) = &frame.kube else {
         f.render_widget(
@@ -310,13 +316,29 @@ fn draw_metrics(f: &mut ratatui::Frame, area: Rect, frame: &Frame) {
     let categories = ["consumer", "throughput", "bottleneck", "health"];
     let mut lines: Vec<Line> = Vec::new();
 
+    // A pod that returned NO present metric this cycle wasn't scraped (the
+    // port-forward is best-effort and can miss a pod per cycle). Pull those out
+    // into one compact line instead of repeating "(no data)" per metric per pod.
+    let (scraped, not_scraped): (Vec<_>, Vec<_>) = report
+        .pod_metric_summaries
+        .iter()
+        .partition(|s| s.lines.iter().any(|l| l.present));
+    if !not_scraped.is_empty() {
+        let names: Vec<&str> = not_scraped.iter().map(|s| short_pod(&s.pod)).collect();
+        lines.push(Line::from(Span::styled(
+            format!("not scraped this cycle ({}): {}", names.len(), names.join(", ")),
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+        )));
+        lines.push(Line::from(""));
+    }
+
     // Pipeline flow, per pod: consumed/s → written/s → sink sent/s, so the shape
     // of the pipeline (and where it narrows) is obvious at a glance.
     lines.push(Line::from(Span::styled(
         "── flow (per pod) ──",
         Style::default().add_modifier(Modifier::BOLD),
     )));
-    for summary in &report.pod_metric_summaries {
+    for summary in &scraped {
         let find = |needle: &str| {
             summary
                 .lines
@@ -353,7 +375,7 @@ fn draw_metrics(f: &mut ratatui::Frame, area: Rect, frame: &Frame) {
     for cat in categories {
         // Collect each pod's lines for this category.
         let mut rows: Vec<(&str, Vec<&crate::kube::MetricLine>, bool)> = Vec::new();
-        for summary in &report.pod_metric_summaries {
+        for summary in &scraped {
             let cat_lines: Vec<&crate::kube::MetricLine> =
                 summary.lines.iter().filter(|l| l.category == cat).collect();
             if cat_lines.is_empty() {
@@ -426,7 +448,20 @@ fn draw_metrics(f: &mut ratatui::Frame, area: Rect, frame: &Frame) {
         lines.push(Line::from(""));
     }
 
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    // Clamp scroll so you can't page past the end. The inner height is the pane
+    // minus the top/bottom border rows.
+    let inner_h = area.height.saturating_sub(2);
+    let total = lines.len() as u16;
+    let max_scroll = total.saturating_sub(inner_h);
+    let offset = scroll.min(max_scroll);
+    // Title shows a scroll position hint when the content overflows.
+    let title = if max_scroll > 0 {
+        format!("fleet metrics  [{}–{}/{}  ↑/↓ PgUp/PgDn]", offset + 1, (offset + inner_h).min(total), total)
+    } else {
+        "fleet metrics".to_string()
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    f.render_widget(Paragraph::new(lines).block(block).scroll((offset, 0)), area);
 }
 
 /// Shorten a pod name to its trailing hash for compact display (the deployment
