@@ -267,8 +267,8 @@ fn run_tui(
             results.iter().map(|h| (h.topic.clone(), h.backlog_or_zero())).collect();
         prev = Some((backlogs, now));
 
-        let kube = fetch_kube_report(cli, kube_config, metrics_config);
-        if let Some(report) = &kube {
+        let mut kube = fetch_kube_report(cli, kube_config, metrics_config);
+        if let Some(report) = &mut kube {
             annotate_with_kube(&mut results, report);
             if metrics_config.enabled {
                 process_metrics(
@@ -459,8 +459,8 @@ fn watch_loop(
         prior_state = state::prior_from_results(&results);
 
         // Kubernetes correlation each cycle (optional).
-        let kube_report = fetch_kube_report(cli, kube_config, metrics_config);
-        if let Some(report) = &kube_report {
+        let mut kube_report = fetch_kube_report(cli, kube_config, metrics_config);
+        if let Some(report) = &mut kube_report {
             annotate_with_kube(&mut results, report);
             if metrics_config.enabled {
                 process_metrics(
@@ -657,23 +657,59 @@ fn watch_specs(metrics_config: &config::MetricsConfig) -> Vec<metrics::MetricSpe
 /// sample as a JSONL record for later tuning. Called once per refresh cycle;
 /// the tracker persists across cycles so trends accumulate.
 fn process_metrics(
-    report: &kube::KubeReport,
+    report: &mut kube::KubeReport,
     tracker: &mut metrics::MetricsTracker,
     capture_dir: Option<&std::path::Path>,
     run_at: &str,
 ) {
     const EPS: f64 = 0.02; // 2% change threshold for flat.
-    for pm in &report.pod_metrics {
-        let summary = tracker.observe(&pm.pod, &pm.metrics_text, EPS);
+    // Collect (pod, text, health) first so we can then borrow report mutably to
+    // write the summaries without overlapping borrows.
+    let scraped: Vec<(String, String, Option<String>)> = report
+        .pod_metrics
+        .iter()
+        .map(|pm| (pm.pod.clone(), pm.metrics_text.clone(), pm.health.clone()))
+        .collect();
+
+    let mut summaries = Vec::with_capacity(scraped.len());
+    for (pod, text, health) in &scraped {
+        // Fold into the rolling tracker and log the one-line summary.
+        let summary = tracker.observe(pod, text, EPS);
         eprintln!("{summary}");
+
+        // Build the structured per-pod summary for the TUI from the verdicts.
+        let verdicts = tracker.verdicts_for(pod, EPS);
+        let lines = verdicts
+            .iter()
+            .map(|v| kube::MetricLine {
+                label: v.label.clone(),
+                value: v.value,
+                arrow: match v.rolling {
+                    metrics::Direction::Up => "↑".to_string(),
+                    metrics::Direction::Down => "↓".to_string(),
+                    metrics::Direction::Flat => "→".to_string(),
+                },
+                breached: v.breached,
+                worsening: v.worsening,
+                improving: v.improving,
+            })
+            .collect();
+        summaries.push(kube::PodMetricSummary {
+            pod: pod.clone(),
+            lines,
+            health: health.clone(),
+        });
+
+        // Raw capture for offline tuning.
         if let Some(dir) = capture_dir {
-            let samples = metrics::parse_prometheus(&pm.metrics_text);
-            let record = metrics::capture_record(run_at, &pm.pod, &samples);
-            if let Err(e) = append_capture(dir, &pm.pod, &record) {
+            let samples = metrics::parse_prometheus(text);
+            let record = metrics::capture_record(run_at, pod, &samples);
+            if let Err(e) = append_capture(dir, pod, &record) {
                 eprintln!("Warning: metrics capture failed: {e}");
             }
         }
     }
+    report.pod_metric_summaries = summaries;
 }
 
 /// Append one JSONL record to `<dir>/metrics-<pod>.jsonl`, creating the dir.

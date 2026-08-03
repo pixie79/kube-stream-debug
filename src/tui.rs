@@ -650,6 +650,36 @@ fn log_stats_lines(report: &crate::kube::KubeReport) -> Vec<Line<'static>> {
     for (msg, count) in stats.top_messages.iter().take(4) {
         lines.push(Line::from(format!("{count}× {msg}")));
     }
+
+    // Live pod-metrics summary (when metrics scraping is enabled). Shows the
+    // curated per-pod metrics with trend arrows; breaches/worsening in colour.
+    if !report.pod_metric_summaries.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "metrics:",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        for summary in &report.pod_metric_summaries {
+            let mut spans: Vec<Span> = vec![Span::raw(format!("  {}: ", summary.pod))];
+            for line in &summary.lines {
+                let style = if line.breached {
+                    Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD)
+                } else if line.worsening {
+                    Style::default().fg(Color::Yellow)
+                } else if line.improving {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default()
+                };
+                spans.push(Span::styled(
+                    format!("{}={:.0}{} ", line.label, line.value, line.arrow),
+                    style,
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
+    }
+
     lines
 }
 

@@ -185,6 +185,29 @@ pub struct LogStats {
     pub throughput_collapsed: bool,
 }
 
+/// One rendered metric line for a pod: label, current value, a trend arrow
+/// (↑/↓/→), and flags for breach/worsening/improving. A flat, serializable view
+/// of a `metrics::MetricVerdict`, kept here so the report has no dependency on
+/// the metrics module's internal types.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct MetricLine {
+    pub label: String,
+    pub value: f64,
+    pub arrow: String,
+    pub breached: bool,
+    pub worsening: bool,
+    pub improving: bool,
+}
+
+/// The curated metric summary for one pod.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct PodMetricSummary {
+    pub pod: String,
+    pub lines: Vec<MetricLine>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health: Option<String>,
+}
+
 /// Raw scraped metrics for one pod: the Prometheus `/metrics` text and the
 /// `/health` body. Parsed and trended by the `metrics` module.
 #[derive(Debug, Clone, Serialize, Default)]
@@ -223,6 +246,11 @@ pub struct KubeReport {
     /// is enabled. Empty otherwise.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pod_metrics: Vec<PodMetrics>,
+    /// Per-pod curated metric summaries (label, value, trend, breach), computed
+    /// from the scrape and carried here so the TUI can render them. Empty when
+    /// metrics scraping is off.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pod_metric_summaries: Vec<PodMetricSummary>,
     /// Distinct images across pods; more than one means a split rollout.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,

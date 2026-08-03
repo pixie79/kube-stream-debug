@@ -183,6 +183,11 @@ impl Series {
 
     /// Rate of change per sample for a counter (current minus previous). Returns
     /// None if fewer than two samples, or if the counter reset (went down).
+    ///
+    /// Part of the public series API for consumers of the rolling history — the
+    /// per-stage throughput counters (`*_total`) are most meaningfully read as a
+    /// rate, which the offline tuning analysis over the JSONL capture uses.
+    #[allow(dead_code)]
     pub fn counter_rate(&self) -> Option<f64> {
         match (self.current(), self.previous()) {
             (Some(cur), Some(prev)) if cur >= prev => Some(cur - prev),
