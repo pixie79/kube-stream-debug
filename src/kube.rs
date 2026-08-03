@@ -197,6 +197,10 @@ pub struct MetricLine {
     pub breached: bool,
     pub worsening: bool,
     pub improving: bool,
+    /// Functional category ("consumer" / "throughput" / "bottleneck" /
+    /// "health"), for the grouped fleet summary.
+    #[serde(default)]
+    pub category: String,
 }
 
 /// The curated metric summary for one pod.

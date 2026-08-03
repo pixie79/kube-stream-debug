@@ -128,6 +128,20 @@ pub struct WatchMetric {
     /// gauge (shown as its current value). Defaults to gauge.
     #[serde(default)]
     pub kind: MetricKind,
+    /// Functional category for the grouped fleet summary. Defaults to health.
+    #[serde(default)]
+    pub category: MetricCategory,
+}
+
+/// Functional grouping for the fleet metrics summary.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MetricCategory {
+    Consumer,
+    Throughput,
+    Bottleneck,
+    #[default]
+    Health,
 }
 
 /// Whether a watched metric is a counter or a gauge (see metrics module).

@@ -153,6 +153,9 @@ fn ui_loop(
                     KeyCode::Char('?') => state.toggle_help(),
                     KeyCode::Char('v') => state.cycle_view(),
                     KeyCode::Char('w') if state.view == View::PodDetail => state.toggle_log_wrap(),
+                    KeyCode::Char('m') if state.view == View::PodDetail => {
+                        state.pod_detail_metrics = !state.pod_detail_metrics;
+                    }
                     KeyCode::Tab if state.view == View::Kube => state.toggle_kube_focus(),
                     KeyCode::Up | KeyCode::Char('k') => {
                         if state.view == View::PodDetail {
@@ -171,7 +174,7 @@ fn ui_loop(
                     KeyCode::Enter => match state.view {
                         View::Kube => state.kube_drill_in(&pod_names, &node_names),
                         View::PodDetail => state.log_expand(),
-                        View::NodeDetail => {}
+                        View::NodeDetail | View::Metrics => {}
                         _ => state.drill_in(&frame.topics),
                     },
                     KeyCode::Esc => {
@@ -222,6 +225,7 @@ fn draw(f: &mut ratatui::Frame, state: &ViewState, frame: &Frame) {
     match state.view {
         View::Topic => draw_topics(f, chunks[1], state, frame),
         View::Kube => draw_kube(f, chunks[1], state, frame),
+        View::Metrics => draw_metrics(f, chunks[1], frame),
         View::Combined => draw_combined(f, chunks[1], state, frame),
         View::PodDetail => draw_pod_detail(f, chunks[1], state, frame),
         View::NodeDetail => draw_node_detail(f, chunks[1], state, frame),
@@ -229,8 +233,9 @@ fn draw(f: &mut ratatui::Frame, state: &ViewState, frame: &Frame) {
 
     let help = match state.view {
         View::Kube => " ↑/↓=move  Tab=pods/nodes  Enter=open  Esc=back  v=view  ?=legend  q=quit",
-        View::PodDetail => " ↑/↓=select  Enter=expand  Esc=collapse/back  w=wrap  q=quit",
+        View::PodDetail => " ↑/↓=select  Enter=expand  Esc=collapse/back  m=logs/metrics  w=wrap  q=quit",
         View::NodeDetail => " Esc=back  ?=legend  r=refresh  q=quit",
+        View::Metrics => " v=view  r=refresh  q=quit  (fleet metrics — breaches red, worsening yellow)",
         _ => " ↑/↓=move  Enter=drill in  Esc=back  v=view  ?=legend  r=refresh  q=quit",
     };
     f.render_widget(Paragraph::new(help), chunks[2]);
@@ -239,6 +244,91 @@ fn draw(f: &mut ratatui::Frame, state: &ViewState, frame: &Frame) {
     if state.show_help {
         draw_help_overlay(f);
     }
+}
+
+/// Render one metric as coloured spans: `label=value↑` with breach red,
+/// worsening yellow, improving green. Shared by the fleet view and pod-detail.
+fn metric_line_spans(line: &crate::kube::MetricLine) -> Vec<Span<'static>> {
+    let style = if line.breached {
+        Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD)
+    } else if line.worsening {
+        Style::default().fg(Color::Yellow)
+    } else if line.improving {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default()
+    };
+    vec![Span::styled(
+        format!("{}={:.0}{}", line.label, line.value, line.arrow),
+        style,
+    )]
+}
+
+/// Fleet-wide metrics summary: every pod's curated metrics, grouped by category
+/// (consumer / throughput / bottleneck / health). Pods with a breach are listed
+/// first within each group. This is the "where's the problem across the fleet"
+/// view.
+fn draw_metrics(f: &mut ratatui::Frame, area: Rect, frame: &Frame) {
+    let block = Block::default().borders(Borders::ALL).title("fleet metrics");
+    let Some(report) = &frame.kube else {
+        f.render_widget(
+            Paragraph::new("metrics scraping is off (set [metrics] enabled = true)").block(block),
+            area,
+        );
+        return;
+    };
+    if report.pod_metric_summaries.is_empty() {
+        f.render_widget(
+            Paragraph::new("no pod metrics scraped yet").block(block),
+            area,
+        );
+        return;
+    }
+
+    let categories = ["consumer", "throughput", "bottleneck", "health"];
+    let mut lines: Vec<Line> = Vec::new();
+
+    for cat in categories {
+        // Any pod that has a breach in this category floats to the top.
+        let mut rows: Vec<(&str, Vec<&crate::kube::MetricLine>, bool)> = Vec::new();
+        for summary in &report.pod_metric_summaries {
+            let cat_lines: Vec<&crate::kube::MetricLine> =
+                summary.lines.iter().filter(|l| l.category == cat).collect();
+            if cat_lines.is_empty() {
+                continue;
+            }
+            let has_breach = cat_lines.iter().any(|l| l.breached);
+            rows.push((short_pod(&summary.pod), cat_lines, has_breach));
+        }
+        if rows.is_empty() {
+            continue;
+        }
+        rows.sort_by_key(|(_, _, breach)| if *breach { 0 } else { 1 });
+
+        lines.push(Line::from(Span::styled(
+            format!("── {cat} ──"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        for (pod, cat_lines, _) in rows {
+            let mut spans: Vec<Span> = vec![Span::raw(format!("  {pod:<14} "))];
+            for (i, ml) in cat_lines.iter().enumerate() {
+                if i > 0 {
+                    spans.push(Span::raw("  "));
+                }
+                spans.extend(metric_line_spans(ml));
+            }
+            lines.push(Line::from(spans));
+        }
+        lines.push(Line::from(""));
+    }
+
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// Shorten a pod name to its trailing hash for compact display (the deployment
+/// prefix is the same across all pods, so the tail is what distinguishes them).
+fn short_pod(pod: &str) -> &str {
+    pod.rsplit('-').next().unwrap_or(pod)
 }
 
 /// Map a status severity to a ratatui colour.
@@ -651,35 +741,6 @@ fn log_stats_lines(report: &crate::kube::KubeReport) -> Vec<Line<'static>> {
         lines.push(Line::from(format!("{count}× {msg}")));
     }
 
-    // Live pod-metrics summary (when metrics scraping is enabled). Shows the
-    // curated per-pod metrics with trend arrows; breaches/worsening in colour.
-    if !report.pod_metric_summaries.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "metrics:",
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
-        for summary in &report.pod_metric_summaries {
-            let mut spans: Vec<Span> = vec![Span::raw(format!("  {}: ", summary.pod))];
-            for line in &summary.lines {
-                let style = if line.breached {
-                    Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD)
-                } else if line.worsening {
-                    Style::default().fg(Color::Yellow)
-                } else if line.improving {
-                    Style::default().fg(Color::Green)
-                } else {
-                    Style::default()
-                };
-                spans.push(Span::styled(
-                    format!("{}={:.0}{} ", line.label, line.value, line.arrow),
-                    style,
-                ));
-            }
-            lines.push(Line::from(spans));
-        }
-    }
-
     lines
 }
 
@@ -712,8 +773,43 @@ fn draw_pod_detail(f: &mut ratatui::Frame, area: Rect, state: &ViewState, frame:
         halves[0],
     );
 
-    // Bottom: either the compact log list (cursored) or the expanded detail.
-    if state.log_expanded {
+    // Bottom: metrics (if toggled with `m`), else logs.
+    if state.pod_detail_metrics {
+        let summary = report.pod_metric_summaries.iter().find(|s| &s.pod == name);
+        let mut lines: Vec<Line> = Vec::new();
+        if let Some(s) = summary {
+            if let Some(h) = &s.health {
+                lines.push(Line::from(format!("health: {h}")));
+                lines.push(Line::from(""));
+            }
+            for cat in ["consumer", "throughput", "bottleneck", "health"] {
+                let cat_lines: Vec<&crate::kube::MetricLine> =
+                    s.lines.iter().filter(|l| l.category == cat).collect();
+                if cat_lines.is_empty() {
+                    continue;
+                }
+                lines.push(Line::from(Span::styled(
+                    format!("── {cat} ──"),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )));
+                for ml in cat_lines {
+                    let mut spans = vec![Span::raw("  ")];
+                    spans.extend(metric_line_spans(ml));
+                    lines.push(Line::from(spans));
+                }
+            }
+        } else {
+            lines.push(Line::from("no metrics for this pod (scraping off or not yet scraped)"));
+        }
+        f.render_widget(
+            Paragraph::new(lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("metrics (m logs · grouped)"),
+            ),
+            halves[1],
+        );
+    } else if state.log_expanded {
         // Pretty-print the selected line, full and (optionally) wrapped.
         let selected = logs
             .and_then(|l| l.lines.get(state.log_cursor))

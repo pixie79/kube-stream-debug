@@ -17,6 +17,9 @@ pub enum View {
     Topic,
     /// Kubernetes consumer-pod health.
     Kube,
+    /// Fleet-wide metrics summary: all pods' curated metrics grouped by category
+    /// (consumer / throughput / bottleneck / health), with alerts and trends.
+    Metrics,
     /// Split: topics on top, partitions (of the selected topic) below.
     Combined,
     /// Detail for a single pod (its resource breakdown, log stats, and raw
@@ -34,7 +37,8 @@ impl View {
     pub fn next(self) -> View {
         match self {
             View::Topic => View::Kube,
-            View::Kube => View::Combined,
+            View::Kube => View::Metrics,
+            View::Metrics => View::Combined,
             View::Combined => View::Topic,
             View::PodDetail | View::NodeDetail => View::Topic,
         }
@@ -44,6 +48,7 @@ impl View {
         match self {
             View::Topic => "topic",
             View::Kube => "kube",
+            View::Metrics => "metrics",
             View::Combined => "combined",
             View::PodDetail => "pod",
             View::NodeDetail => "node",
@@ -81,6 +86,9 @@ pub struct ViewState {
     pub log_expanded: bool,
     /// Whether long lines wrap (true) or are truncated (false) in the detail.
     pub log_wrap: bool,
+    /// In pod-detail, whether the bottom pane shows this pod's metrics (true) or
+    /// its logs (false). Toggled with `m`.
+    pub pod_detail_metrics: bool,
     /// When set, the node-detail view is showing this node.
     pub selected_node: Option<String>,
     /// Whether the status-legend help overlay is showing.
@@ -98,6 +106,7 @@ impl Default for ViewState {
             log_cursor: 0,
             log_expanded: false,
             log_wrap: true,
+            pod_detail_metrics: false,
             selected_node: None,
             show_help: false,
         }
@@ -410,10 +419,12 @@ mod tests {
     }
 
     #[test]
-    fn view_cycles_through_three() {
+    fn view_cycles_through_four() {
         let mut v = View::Topic;
         v = v.next();
         assert_eq!(v, View::Kube);
+        v = v.next();
+        assert_eq!(v, View::Metrics);
         v = v.next();
         assert_eq!(v, View::Combined);
         v = v.next();

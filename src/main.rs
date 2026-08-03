@@ -652,6 +652,12 @@ fn watch_specs(metrics_config: &config::MetricsConfig) -> Vec<metrics::MetricSpe
                 config::MetricKind::Gauge => metrics::MetricKind::Gauge,
                 config::MetricKind::Counter => metrics::MetricKind::Counter,
             },
+            category: match w.category {
+                config::MetricCategory::Consumer => metrics::MetricCategory::Consumer,
+                config::MetricCategory::Throughput => metrics::MetricCategory::Throughput,
+                config::MetricCategory::Bottleneck => metrics::MetricCategory::Bottleneck,
+                config::MetricCategory::Health => metrics::MetricCategory::Health,
+            },
         })
         .collect()
 }
@@ -696,6 +702,7 @@ fn process_metrics(
                 breached: v.breached,
                 worsening: v.worsening,
                 improving: v.improving,
+                category: v.category.label().to_string(),
             })
             .collect();
         summaries.push(kube::PodMetricSummary {
