@@ -375,12 +375,57 @@ pub fn curated_series() -> &'static [(&'static str, &'static str, Polarity, Metr
     ]
 }
 
+/// Whether an actual scraped metric name matches a configured name, tolerating
+/// the type/unit suffixes a Prometheus/OpenTelemetry exporter appends. A counter
+/// `ssync_x` may be exported as `ssync_x_total`; a byte gauge `ssync_x` as
+/// `ssync_x_bytes`; and combinations like `ssync_x_bytes_total` occur. We accept
+/// the exact name, or the name followed by any run of known suffixes.
+fn name_matches(actual: &str, configured: &str) -> bool {
+    if actual == configured {
+        return true;
+    }
+    let Some(rest) = actual.strip_prefix(configured) else {
+        return false;
+    };
+    // `rest` must be a sequence of `_<suffix>` segments and nothing else, so we
+    // don't match a different metric that merely shares a prefix.
+    // Type/unit suffixes an exporter appends to scalar metrics. Deliberately
+    // excludes histogram components (_bucket/_count/_sum), which are separate
+    // series and must not be folded into a scalar metric's value.
+    const SUFFIXES: &[&str] = &[
+        "_total",
+        "_bytes",
+        "_milliseconds",
+        "_seconds",
+        "_ratio",
+    ];
+    let mut rem = rest;
+    if rem.is_empty() {
+        return false;
+    }
+    while !rem.is_empty() {
+        match SUFFIXES.iter().find(|suf| rem.starts_with(**suf)) {
+            Some(suf) => rem = &rem[suf.len()..],
+            None => return false,
+        }
+    }
+    true
+}
+
 /// Aggregate the current value of a metric across all its label series (e.g.
-/// per-topic lag summed). For gauges that's a sum; good enough for a headline.
+/// per-topic lag summed). Matching tolerates exporter type/unit suffixes (see
+/// `name_matches`). Histogram component series (`_bucket`) are excluded so a
+/// histogram doesn't sum into a meaningless total.
 fn aggregate_value(samples: &[Sample], name_prefix: &str) -> Option<f64> {
     let matching: Vec<f64> = samples
         .iter()
-        .filter(|s| s.name == name_prefix)
+        .filter(|s| {
+            // Exclude histogram component series entirely.
+            !s.name.ends_with("_bucket")
+                && !s.name.ends_with("_count")
+                && !s.name.ends_with("_sum")
+                && name_matches(&s.name, name_prefix)
+        })
         .map(|s| s.value)
         .filter(|v| v.is_finite())
         .collect();
@@ -836,6 +881,45 @@ ssync_pipeline_unhealthy 0";
             Sample { name: "ssync_pulsar_consumer_lag".into(), labels: vec![("partition".into(), "1".into())], value: 800.0 },
         ];
         assert_eq!(aggregate_value(&samples, "ssync_pulsar_consumer_lag"), Some(2000.0));
+    }
+
+    #[test]
+    fn name_matches_tolerates_exporter_suffixes() {
+        // Exact.
+        assert!(name_matches("ssync_decoded_channel_depth", "ssync_decoded_channel_depth"));
+        // Single _total (counter convention).
+        assert!(name_matches("ssync_batches_flushed_total", "ssync_batches_flushed"));
+        // Double _total (config already ended in _total, exporter added another).
+        assert!(name_matches("ssync_sink_records_sent_total_total", "ssync_sink_records_sent_total"));
+        // Unit + total combo.
+        assert!(name_matches("ssync_bytes_received_total_bytes_total", "ssync_bytes_received_total"));
+        // Unit only.
+        assert!(name_matches("ssync_memory_rss_bytes_bytes", "ssync_memory_rss_bytes"));
+        // A different metric sharing a prefix must NOT match.
+        assert!(!name_matches("ssync_batch_size_count", "ssync_batch"));
+        assert!(!name_matches("ssync_batcher_channel_depth", "ssync_batch"));
+        // Non-suffix trailing text must not match.
+        assert!(!name_matches("ssync_batch_extra", "ssync_batch"));
+    }
+
+    #[test]
+    fn aggregate_finds_suffixed_counter() {
+        let samples = vec![
+            Sample { name: "ssync_sink_records_sent_total_total".into(), labels: vec![], value: 4200.0 },
+        ];
+        // Configured without the exporter's extra _total.
+        assert_eq!(aggregate_value(&samples, "ssync_sink_records_sent_total"), Some(4200.0));
+    }
+
+    #[test]
+    fn aggregate_excludes_histogram_components() {
+        let samples = vec![
+            Sample { name: "ssync_batch_size_bucket".into(), labels: vec![("le".into(), "10".into())], value: 99.0 },
+            Sample { name: "ssync_batch_size_count".into(), labels: vec![], value: 5.0 },
+            Sample { name: "ssync_batch_size_sum".into(), labels: vec![], value: 50.0 },
+        ];
+        // None of the histogram components should match a scalar "ssync_batch_size".
+        assert_eq!(aggregate_value(&samples, "ssync_batch_size"), None);
     }
 
     #[test]
