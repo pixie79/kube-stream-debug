@@ -201,6 +201,15 @@ pub struct MetricLine {
     /// "health"), for the grouped fleet summary.
     #[serde(default)]
     pub category: String,
+    /// Whether the value moved since the previous scrape (arrow shown only if so).
+    #[serde(default)]
+    pub changed: bool,
+    /// Whether a higher-better metric is sitting at zero (pipeline not moving).
+    #[serde(default)]
+    pub stalled: bool,
+    /// Whether the value is a per-scrape rate (counter), for a "/s" suffix.
+    #[serde(default)]
+    pub is_rate: bool,
 }
 
 /// The curated metric summary for one pod.

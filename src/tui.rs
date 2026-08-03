@@ -250,20 +250,30 @@ fn draw(f: &mut ratatui::Frame, state: &ViewState, frame: &Frame) {
     }
 }
 
-/// Render one metric as coloured spans: `label=value↑` with breach red,
-/// worsening yellow, improving green. Shared by the fleet view and pod-detail.
+/// Render one metric as coloured spans. Value shown with a "/s" suffix for
+/// rates; a trend arrow only when the value actually moved. Colour: red breach,
+/// yellow worsening or stalled (higher-better at 0), green improving, dim gray
+/// when flat and healthy (so the eye skips the noise and lands on what matters).
 fn metric_line_spans(line: &crate::kube::MetricLine) -> Vec<Span<'static>> {
     let style = if line.breached {
         Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD)
-    } else if line.worsening {
+    } else if line.worsening || line.stalled {
         Style::default().fg(Color::Yellow)
     } else if line.improving {
         Style::default().fg(Color::Green)
     } else {
-        Style::default()
+        // Flat and healthy — dim so it recedes.
+        Style::default().fg(Color::DarkGray)
+    };
+    // Arrow only when the value moved; rates get a "/s" suffix.
+    let suffix = if line.is_rate { "/s" } else { "" };
+    let arrow = if line.changed && !line.arrow.is_empty() {
+        line.arrow.clone()
+    } else {
+        String::new()
     };
     vec![Span::styled(
-        format!("{}={:.0}{}", line.label, line.value, line.arrow),
+        format!("{}={:.0}{suffix}{arrow}", line.label, line.value),
         style,
     )]
 }
@@ -292,8 +302,48 @@ fn draw_metrics(f: &mut ratatui::Frame, area: Rect, frame: &Frame) {
     let categories = ["consumer", "throughput", "bottleneck", "health"];
     let mut lines: Vec<Line> = Vec::new();
 
+    // Pipeline flow, per pod: consumed/s → written/s → sink sent/s, so the shape
+    // of the pipeline (and where it narrows) is obvious at a glance.
+    lines.push(Line::from(Span::styled(
+        "── flow (per pod) ──",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    for summary in &report.pod_metric_summaries {
+        let find = |needle: &str| {
+            summary
+                .lines
+                .iter()
+                .find(|l| l.label.contains(needle))
+                .map(|l| l.value)
+        };
+        // Prefer explicit stage rates; fall back to throughput rps.
+        let consumed = find("consumed");
+        let written = find("written");
+        let sink = find("sink");
+        if consumed.is_none() && written.is_none() && sink.is_none() {
+            continue;
+        }
+        let fmt = |v: Option<f64>| v.map(|x| format!("{x:.0}")).unwrap_or_else(|| "—".into());
+        let mut spans = vec![Span::raw(format!("  {:<14} ", short_pod(&summary.pod)))];
+        // Colour the flow yellow if any stage is zero while an upstream one isn't
+        // (a stall/narrowing), else dim.
+        let stalled_flow = matches!((consumed, written), (Some(c), Some(w)) if c > 0.0 && w == 0.0)
+            || matches!((written, sink), (Some(w), Some(s)) if w > 0.0 && s == 0.0);
+        let style = if stalled_flow {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        spans.push(Span::styled(
+            format!("consumed {}/s → written {}/s → sink {}/s", fmt(consumed), fmt(written), fmt(sink)),
+            style,
+        ));
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(""));
+
     for cat in categories {
-        // Any pod that has a breach in this category floats to the top.
+        // Collect each pod's lines for this category.
         let mut rows: Vec<(&str, Vec<&crate::kube::MetricLine>, bool)> = Vec::new();
         for summary in &report.pod_metric_summaries {
             let cat_lines: Vec<&crate::kube::MetricLine> =
@@ -307,15 +357,56 @@ fn draw_metrics(f: &mut ratatui::Frame, area: Rect, frame: &Frame) {
         if rows.is_empty() {
             continue;
         }
-        rows.sort_by_key(|(_, _, breach)| if *breach { 0 } else { 1 });
 
         lines.push(Line::from(Span::styled(
             format!("── {cat} ──"),
             Style::default().add_modifier(Modifier::BOLD),
         )));
-        for (pod, cat_lines, _) in rows {
+
+        // Collapse metrics that are identical across every pod into one line, so
+        // the screen doesn't repeat "throughput rps=0" six times. A metric label
+        // qualifies if every pod reports the same value, none breached/worsening.
+        let all_labels: Vec<String> = rows
+            .first()
+            .map(|(_, ls, _)| ls.iter().map(|l| l.label.clone()).collect())
+            .unwrap_or_default();
+        let mut collapsed: Vec<&str> = Vec::new();
+        for label in &all_labels {
+            let vals: Vec<&crate::kube::MetricLine> = rows
+                .iter()
+                .filter_map(|(_, ls, _)| ls.iter().find(|l| &l.label == label).copied())
+                .collect();
+            let uniform = vals.len() == rows.len()
+                && vals.iter().all(|l| {
+                    (l.value - vals[0].value).abs() < f64::EPSILON
+                        && !l.breached
+                        && !l.worsening
+                        && !l.stalled
+                });
+            if uniform && !vals.is_empty() {
+                let mut spans = vec![Span::raw("  ")];
+                spans.extend(metric_line_spans(vals[0]));
+                spans.push(Span::styled(
+                    format!("  (all {} pods)", rows.len()),
+                    Style::default().fg(Color::DarkGray),
+                ));
+                lines.push(Line::from(spans));
+                collapsed.push(label);
+            }
+        }
+
+        // Per-pod rows for the metrics that aren't uniform. Breached pods first.
+        let mut per_pod: Vec<&(&str, Vec<&crate::kube::MetricLine>, bool)> =
+            rows.iter().filter(|(_, ls, _)| ls.iter().any(|l| !collapsed.contains(&l.label.as_str()))).collect();
+        per_pod.sort_by_key(|(_, _, breach)| if *breach { 0 } else { 1 });
+        for (pod, cat_lines, _) in per_pod {
+            let shown: Vec<&&crate::kube::MetricLine> =
+                cat_lines.iter().filter(|l| !collapsed.contains(&l.label.as_str())).collect();
+            if shown.is_empty() {
+                continue;
+            }
             let mut spans: Vec<Span> = vec![Span::raw(format!("  {pod:<14} "))];
-            for (i, ml) in cat_lines.iter().enumerate() {
+            for (i, ml) in shown.iter().enumerate() {
                 if i > 0 {
                     spans.push(Span::raw("  "));
                 }

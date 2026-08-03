@@ -700,12 +700,15 @@ fn process_metrics(
                 arrow: match v.rolling {
                     metrics::Direction::Up => "↑".to_string(),
                     metrics::Direction::Down => "↓".to_string(),
-                    metrics::Direction::Flat => "→".to_string(),
+                    metrics::Direction::Flat => "".to_string(),
                 },
                 breached: v.breached,
                 worsening: v.worsening,
                 improving: v.improving,
                 category: v.category.label().to_string(),
+                changed: v.changed,
+                stalled: v.stalled,
+                is_rate: v.is_rate,
             })
             .collect();
         summaries.push(kube::PodMetricSummary {

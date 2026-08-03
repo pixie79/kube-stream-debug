@@ -232,6 +232,14 @@ pub struct MetricVerdict {
     pub is_rate: bool,
     /// The metric's functional category, for the grouped fleet summary.
     pub category: MetricCategory,
+    /// True when the value actually changed since the previous scrape. Lets the
+    /// display show a trend arrow only when something moved (a screen full of
+    /// "flat" arrows communicates nothing).
+    pub changed: bool,
+    /// True when a higher-better metric is sitting at zero — i.e. the pipeline
+    /// isn't moving. Notable even without a configured threshold: for a
+    /// throughput metric, 0 is the alarming case, not the neutral one.
+    pub stalled: bool,
 }
 
 /// Whether a direction is "bad" given the metric's polarity.
@@ -422,6 +430,14 @@ impl MetricHistory {
             // Threshold is checked against the displayed value (the rate for a
             // counter, so a "writes/s below N" alert works as expected).
             let breached = threshold_breached(display_value, spec.threshold, spec.polarity);
+            // Did the displayed value move since the last scrape?
+            let changed = match (series.current(), series.previous()) {
+                (Some(c), Some(p)) => (c - p).abs() > (p.abs() * eps).max(1e-9),
+                _ => false,
+            };
+            // A higher-better metric at zero means the pipeline isn't moving —
+            // notable even with no threshold configured.
+            let stalled = spec.polarity == Polarity::HigherBetter && display_value == 0.0;
             out.push(MetricVerdict {
                 label: spec.label.clone(),
                 value: display_value,
@@ -432,13 +448,15 @@ impl MetricHistory {
                 breached,
                 is_rate,
                 category: spec.category,
+                changed,
+                stalled,
             });
         }
-        // Worst-first: a threshold breach outranks a mere worsening trend.
+        // Worst-first: breach, then worsening/stalled, then flat, then improving.
         out.sort_by_key(|v| {
             if v.breached {
                 0
-            } else if v.worsening {
+            } else if v.worsening || v.stalled {
                 1
             } else if v.improving {
                 3
@@ -456,13 +474,20 @@ pub fn format_summary(pod: &str, verdicts: &[MetricVerdict]) -> String {
     let mut out = String::new();
     let _ = write!(out, "metrics[{pod}]:");
     for v in verdicts {
-        let arrow = match v.rolling {
-            Direction::Up => "↑",
-            Direction::Down => "↓",
-            Direction::Flat => "→",
+        // Arrow only when the value moved.
+        let arrow = if v.changed {
+            match v.rolling {
+                Direction::Up => "↑",
+                Direction::Down => "↓",
+                Direction::Flat => "",
+            }
+        } else {
+            ""
         };
         let mark = if v.breached {
             " ‼"
+        } else if v.stalled {
+            " ⊘" // stalled: higher-better sitting at zero
         } else if v.worsening {
             " ⚠"
         } else if v.improving {
@@ -470,7 +495,8 @@ pub fn format_summary(pod: &str, verdicts: &[MetricVerdict]) -> String {
         } else {
             ""
         };
-        let _ = write!(out, " {}={:.0}{arrow}{mark}", v.label, v.value);
+        let suffix = if v.is_rate { "/s" } else { "" };
+        let _ = write!(out, " {}={:.0}{suffix}{arrow}{mark}", v.label, v.value);
     }
     out
 }
@@ -784,6 +810,27 @@ ssync_pipeline_unhealthy 0";
     }
 
     #[test]
+    fn higher_better_at_zero_is_stalled() {
+        let specs = vec![MetricSpec {
+            name: "ssync_throughput_rate".into(),
+            label: "tput".into(),
+            polarity: Polarity::HigherBetter,
+            threshold: None,
+            kind: MetricKind::Gauge,
+            category: MetricCategory::Throughput,
+        }];
+        let mut h = MetricHistory::default();
+        for v in [0.0, 0.0] {
+            let samples = vec![Sample { name: "ssync_throughput_rate".into(), labels: vec![], value: v }];
+            h.update(&samples, &specs, 5);
+        }
+        let verdicts = h.verdicts(&specs, 0.01);
+        let t = verdicts.iter().find(|x| x.label == "tput").unwrap();
+        assert!(t.stalled, "higher-better metric at 0 should be flagged stalled");
+        assert!(!t.changed, "0 → 0 didn't change");
+    }
+
+    #[test]
     fn summary_formats_with_arrows() {
         let verdicts = vec![MetricVerdict {
             label: "consumer lag".into(),
@@ -795,6 +842,8 @@ ssync_pipeline_unhealthy 0";
             breached: false,
             is_rate: false,
             category: MetricCategory::Consumer,
+            changed: true,
+            stalled: false,
         }];
         let s = format_summary("pod-a", &verdicts);
         assert!(s.contains("metrics[pod-a]"));
