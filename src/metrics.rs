@@ -189,6 +189,22 @@ impl Series {
             _ => None,
         }
     }
+
+    /// Total variation across the window: the sum of absolute step-to-step
+    /// changes. Unlike first-vs-last delta, this catches churn — a value that
+    /// oscillates 30→8→30→8 has a net delta of 0 but a large total variation, so
+    /// it's the right signal for "this gauge keeps changing" (rebalance churn).
+    pub fn total_variation(&self) -> f64 {
+        self.values
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .sum()
+    }
+
+    /// Number of samples currently held.
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
 }
 
 fn mean(xs: &[f64]) -> f64 {
@@ -436,6 +452,55 @@ fn aggregate_value(samples: &[Sample], name_prefix: &str) -> Option<f64> {
     }
 }
 
+/// Per-pod connection-stability verdict, for the stability view. Detects the
+/// idle→cull→rebalance→reconnect flapping loop from churn in the transition
+/// counters and the active-partition gauge.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct PodStability {
+    pub pod: String,
+    /// Reconnect/cull events per scrape (rate of the cull counter if present,
+    /// else a proxy from throttle transitions).
+    pub reconnect_rate: f64,
+    /// Throttle state-transition events per scrape (flapping in/out of throttle).
+    pub throttle_transition_rate: f64,
+    /// How much the active-partition count moved across the window (total
+    /// variation) — high means partitions keep being gained/lost (rebalance
+    /// churn), even if the net count looks stable.
+    pub active_parts_churn: f64,
+    /// Current active partition count (for context).
+    pub active_parts: f64,
+    /// True when transition/reconnect rate is high enough to call it flapping.
+    pub flapping_rate: bool,
+    /// True when the active-partition count keeps changing (rebalance churn).
+    pub flapping_rebalance: bool,
+}
+
+impl PodStability {
+    /// Whether this pod shows any instability signal.
+    pub fn unstable(&self) -> bool {
+        self.flapping_rate || self.flapping_rebalance
+    }
+}
+
+/// Metric names the stability view reads. Kept separate from the curated watch
+/// list so stability works regardless of the operator's [[metrics.watch]] config;
+/// matched suffix-tolerantly like everything else.
+pub fn stability_series_names() -> &'static [&'static str] {
+    &[
+        "ssync_source_consumers_culled", // the metric we're asking stream-sync to add
+        "ssync_source_throttle_transitions_total",
+        "ssync_source_throttled_total",
+        "ssync_partitions_active_subscribed",
+        "ssync_source_partitions_active",
+        "ssync_destination_consecutive_failures",
+    ]
+}
+
+/// Thresholds for the flapping verdicts. Conservative — a couple of transitions
+/// over the window is normal; sustained churn is not.
+const FLAP_RATE_THRESHOLD: f64 = 2.0; // transitions/reconnects per scrape
+const REBALANCE_CHURN_THRESHOLD: f64 = 4.0; // total active-partition movement
+
 /// Rolling per-pod metric history, keyed by watched metric name. Updated each
 /// scrape against a set of specs (operator-configured or the built-in default);
 /// produces the verdict list for the summary.
@@ -451,6 +516,51 @@ impl MetricHistory {
             if let Some(v) = aggregate_value(samples, &spec.name) {
                 self.series.entry(spec.name.clone()).or_default().push(v, window);
             }
+        }
+        // Also track the stability series, regardless of the watch config, so the
+        // stability view works without the operator configuring these by hand.
+        for name in stability_series_names() {
+            if let Some(v) = aggregate_value(samples, name) {
+                self.series.entry((*name).to_string()).or_default().push(v, window);
+            }
+        }
+    }
+
+    /// Compute the connection-stability verdict for this pod from the tracked
+    /// transition counters and the active-partition gauge.
+    pub fn stability(&self, pod: &str) -> PodStability {
+        let rate = |name: &str| self.series.get(name).and_then(|s| s.counter_rate()).unwrap_or(0.0);
+        let gauge = |name: &str| self.series.get(name).and_then(|s| s.current()).unwrap_or(0.0);
+        let variation = |name: &str| self.series.get(name).map(|s| s.total_variation()).unwrap_or(0.0);
+
+        // Reconnect/cull rate: prefer the (future) cull counter; else proxy from
+        // throttle transitions, which spike during the cull→rebalance loop.
+        let cull_rate = rate("ssync_source_consumers_culled");
+        let throttle_transition_rate = rate("ssync_source_throttle_transitions_total");
+        let reconnect_rate = if cull_rate > 0.0 { cull_rate } else { throttle_transition_rate };
+
+        // Active-partition churn: total variation of the active-subscribed gauge
+        // (falls back to source_partitions_active if the former is absent).
+        let active_name = if self.series.contains_key("ssync_partitions_active_subscribed") {
+            "ssync_partitions_active_subscribed"
+        } else {
+            "ssync_source_partitions_active"
+        };
+        let active_parts_churn = variation(active_name);
+        let active_parts = gauge(active_name);
+
+        let flapping_rate = reconnect_rate >= FLAP_RATE_THRESHOLD
+            || throttle_transition_rate >= FLAP_RATE_THRESHOLD;
+        let flapping_rebalance = active_parts_churn >= REBALANCE_CHURN_THRESHOLD;
+
+        PodStability {
+            pod: pod.to_string(),
+            reconnect_rate,
+            throttle_transition_rate,
+            active_parts_churn,
+            active_parts,
+            flapping_rate,
+            flapping_rebalance,
         }
     }
 
@@ -620,6 +730,14 @@ impl MetricsTracker {
             .get(pod)
             .map(|h| h.verdicts(&self.specs, eps))
             .unwrap_or_default()
+    }
+
+    /// Connection-stability verdict for a pod (flapping detection).
+    pub fn stability_for(&self, pod: &str) -> PodStability {
+        self.per_pod
+            .get(pod)
+            .map(|h| h.stability(pod))
+            .unwrap_or_else(|| PodStability { pod: pod.to_string(), ..Default::default() })
     }
 }
 
@@ -881,6 +999,63 @@ ssync_pipeline_unhealthy 0";
             Sample { name: "ssync_pulsar_consumer_lag".into(), labels: vec![("partition".into(), "1".into())], value: 800.0 },
         ];
         assert_eq!(aggregate_value(&samples, "ssync_pulsar_consumer_lag"), Some(2000.0));
+    }
+
+    #[test]
+    fn stability_flags_flapping_pod() {
+        let specs: Vec<MetricSpec> = vec![]; // stability tracks its own series
+        let mut h = MetricHistory::default();
+        // Simulate the loop: throttle transitions climbing each scrape, active
+        // partitions oscillating (90 → 0 → 90 → 0 = huge churn).
+        let scrapes = [
+            (100.0, 90.0),
+            (105.0, 0.0),
+            (110.0, 90.0),
+            (115.0, 0.0),
+        ];
+        for (transitions, active) in scrapes {
+            let samples = vec![
+                Sample { name: "ssync_source_throttle_transitions_total".into(), labels: vec![], value: transitions },
+                Sample { name: "ssync_partitions_active_subscribed".into(), labels: vec![], value: active },
+            ];
+            h.update(&samples, &specs, 5);
+        }
+        let s = h.stability("pod-flap");
+        assert!(s.flapping_rate, "climbing transition rate should flag flapping_rate");
+        assert!(s.flapping_rebalance, "oscillating active partitions should flag rebalance churn");
+        assert!(s.unstable());
+        // Churn is the sum of |steps|: 90+90+90 = 270, well over threshold.
+        assert!(s.active_parts_churn >= 4.0);
+    }
+
+    #[test]
+    fn stability_clears_stable_pod() {
+        let specs: Vec<MetricSpec> = vec![];
+        let mut h = MetricHistory::default();
+        // Stable: no transitions, steady partition count.
+        for _ in 0..4 {
+            let samples = vec![
+                Sample { name: "ssync_source_throttle_transitions_total".into(), labels: vec![], value: 50.0 },
+                Sample { name: "ssync_partitions_active_subscribed".into(), labels: vec![], value: 90.0 },
+            ];
+            h.update(&samples, &specs, 5);
+        }
+        let s = h.stability("pod-stable");
+        assert!(!s.flapping_rate, "no transitions → not flapping");
+        assert!(!s.flapping_rebalance, "steady partitions → no rebalance churn");
+        assert!(!s.unstable());
+        assert_eq!(s.active_parts, 90.0);
+    }
+
+    #[test]
+    fn total_variation_catches_oscillation() {
+        let mut s = Series::default();
+        for v in [30.0, 8.0, 30.0, 8.0] {
+            s.push(v, 10);
+        }
+        // Net first-vs-last delta is 22, but total variation is 22+22+22 = 66.
+        assert_eq!(s.total_variation(), 66.0);
+        assert_eq!(s.current(), Some(8.0));
     }
 
     #[test]

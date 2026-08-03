@@ -180,7 +180,7 @@ fn ui_loop(
                     KeyCode::Enter => match state.view {
                         View::Kube => state.kube_drill_in(&pod_names, &node_names),
                         View::PodDetail => state.log_expand(),
-                        View::NodeDetail | View::Metrics => {}
+                        View::NodeDetail | View::Metrics | View::Stability => {}
                         _ => state.drill_in(&frame.topics),
                     },
                     KeyCode::Esc => {
@@ -236,6 +236,7 @@ fn draw(f: &mut ratatui::Frame, state: &ViewState, frame: &Frame) {
         View::Topic => draw_topics(f, chunks[1], state, frame),
         View::Kube => draw_kube(f, chunks[1], state, frame),
         View::Metrics => draw_metrics(f, chunks[1], frame, state.metrics_scroll),
+        View::Stability => draw_stability(f, chunks[1], frame),
         View::Combined => draw_combined(f, chunks[1], state, frame),
         View::PodDetail => draw_pod_detail(f, chunks[1], state, frame),
         View::NodeDetail => draw_node_detail(f, chunks[1], state, frame),
@@ -246,6 +247,7 @@ fn draw(f: &mut ratatui::Frame, state: &ViewState, frame: &Frame) {
         View::PodDetail => " ↑/↓=select  Enter=expand  Esc=collapse/back  m=logs/metrics  w=wrap  q=quit",
         View::NodeDetail => " Esc=back  ?=legend  r=refresh  q=quit",
         View::Metrics => " ↑/↓ PgUp/PgDn=scroll  v=view  r=refresh  q=quit",
+        View::Stability => " v=view  r=refresh  q=quit  (connection stability — flapping pods flagged)",
         _ => " ↑/↓=move  Enter=drill in  Esc=back  v=view  ?=legend  r=refresh  q=quit",
     };
     f.render_widget(Paragraph::new(help), chunks[2]);
@@ -468,6 +470,80 @@ fn draw_metrics(f: &mut ratatui::Frame, area: Rect, frame: &Frame, scroll: u16) 
 /// prefix is the same across all pods, so the tail is what distinguishes them).
 fn short_pod(pod: &str) -> &str {
     pod.rsplit('-').next().unwrap_or(pod)
+}
+
+/// Connection-stability view: a per-pod table of reconnect/throttle-transition
+/// rates and active-partition churn, flagging pods caught in an idle→cull→
+/// rebalance flapping loop. Unstable pods sort to the top.
+fn draw_stability(f: &mut ratatui::Frame, area: Rect, frame: &Frame) {
+    let block = Block::default().borders(Borders::ALL).title("connection stability");
+    let Some(report) = &frame.kube else {
+        f.render_widget(
+            Paragraph::new("metrics scraping is off (set [metrics] enabled = true)").block(block),
+            area,
+        );
+        return;
+    };
+    if report.pod_stability.is_empty() {
+        f.render_widget(
+            Paragraph::new("no stability data yet (needs a few scrapes to compute churn)").block(block),
+            area,
+        );
+        return;
+    }
+
+    let header = Row::new(vec![
+        Cell::from("POD"),
+        Cell::from("RECONNECT/s"),
+        Cell::from("THROTTLE-TRANS/s"),
+        Cell::from("ACTIVE-PARTS"),
+        Cell::from("CHURN"),
+        Cell::from("VERDICT"),
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD));
+
+    let mut rows: Vec<&crate::kube::PodStabilityLine> = report.pod_stability.iter().collect();
+    // Unstable pods first.
+    rows.sort_by_key(|s| if s.flapping_rate || s.flapping_rebalance { 0 } else { 1 });
+
+    let table_rows: Vec<Row> = rows
+        .iter()
+        .map(|s| {
+            let unstable = s.flapping_rate || s.flapping_rebalance;
+            // Build the verdict text from the two independent signals.
+            let verdict = match (s.flapping_rate, s.flapping_rebalance) {
+                (true, true) => "FLAPPING (reconnect + rebalance)",
+                (true, false) => "FLAPPING (reconnect churn)",
+                (false, true) => "FLAPPING (rebalance churn)",
+                (false, false) => "stable",
+            };
+            let row_style = if unstable {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            Row::new(vec![
+                Cell::from(short_pod(&s.pod).to_string()),
+                Cell::from(format!("{:.1}", s.reconnect_rate)),
+                Cell::from(format!("{:.1}", s.throttle_transition_rate)),
+                Cell::from(format!("{:.0}", s.active_parts)),
+                Cell::from(format!("{:.0}", s.active_parts_churn)),
+                Cell::from(verdict),
+            ])
+            .style(row_style)
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(16),
+        Constraint::Length(13),
+        Constraint::Length(18),
+        Constraint::Length(13),
+        Constraint::Length(8),
+        Constraint::Min(20),
+    ];
+    let table = Table::new(table_rows, widths).header(header).block(block);
+    f.render_widget(table, area);
 }
 
 /// Map a status severity to a ratatui colour.

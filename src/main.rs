@@ -730,6 +730,23 @@ fn process_metrics(
         }
     }
     report.pod_metric_summaries = summaries;
+
+    // Per-pod connection-stability verdicts (flapping detection).
+    report.pod_stability = scraped
+        .iter()
+        .map(|(pod, _, _)| {
+            let s = tracker.stability_for(pod);
+            kube::PodStabilityLine {
+                pod: pod.clone(),
+                reconnect_rate: s.reconnect_rate,
+                throttle_transition_rate: s.throttle_transition_rate,
+                active_parts_churn: s.active_parts_churn,
+                active_parts: s.active_parts,
+                flapping_rate: s.flapping_rate,
+                flapping_rebalance: s.flapping_rebalance,
+            }
+        })
+        .collect();
 }
 
 /// Append one JSONL record to `<dir>/metrics-<pod>.jsonl`, creating the dir.

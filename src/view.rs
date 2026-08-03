@@ -20,6 +20,10 @@ pub enum View {
     /// Fleet-wide metrics summary: all pods' curated metrics grouped by category
     /// (consumer / throughput / bottleneck / health), with alerts and trends.
     Metrics,
+    /// Per-pod connection stability: reconnect/throttle-transition rates and
+    /// active-partition churn, flagging pods caught in an idle→cull→rebalance
+    /// flapping loop.
+    Stability,
     /// Split: topics on top, partitions (of the selected topic) below.
     Combined,
     /// Detail for a single pod (its resource breakdown, log stats, and raw
@@ -38,7 +42,8 @@ impl View {
         match self {
             View::Topic => View::Kube,
             View::Kube => View::Metrics,
-            View::Metrics => View::Combined,
+            View::Metrics => View::Stability,
+            View::Stability => View::Combined,
             View::Combined => View::Topic,
             View::PodDetail | View::NodeDetail => View::Topic,
         }
@@ -49,6 +54,7 @@ impl View {
             View::Topic => "topic",
             View::Kube => "kube",
             View::Metrics => "metrics",
+            View::Stability => "stability",
             View::Combined => "combined",
             View::PodDetail => "pod",
             View::NodeDetail => "node",
@@ -439,6 +445,8 @@ mod tests {
         assert_eq!(v, View::Kube);
         v = v.next();
         assert_eq!(v, View::Metrics);
+        v = v.next();
+        assert_eq!(v, View::Stability);
         v = v.next();
         assert_eq!(v, View::Combined);
         v = v.next();

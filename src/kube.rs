@@ -215,6 +215,19 @@ pub struct MetricLine {
     pub present: bool,
 }
 
+/// The stability view's per-pod row: churn rates and the flapping verdicts. A
+/// flat, serializable mirror of `metrics::PodStability`.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct PodStabilityLine {
+    pub pod: String,
+    pub reconnect_rate: f64,
+    pub throttle_transition_rate: f64,
+    pub active_parts_churn: f64,
+    pub active_parts: f64,
+    pub flapping_rate: bool,
+    pub flapping_rebalance: bool,
+}
+
 /// The curated metric summary for one pod.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct PodMetricSummary {
@@ -267,6 +280,10 @@ pub struct KubeReport {
     /// metrics scraping is off.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pod_metric_summaries: Vec<PodMetricSummary>,
+    /// Per-pod connection-stability verdicts (flapping detection). Empty when
+    /// metrics scraping is off.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pod_stability: Vec<PodStabilityLine>,
     /// Distinct images across pods; more than one means a split rollout.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
