@@ -709,6 +709,7 @@ fn process_metrics(
                 changed: v.changed,
                 stalled: v.stalled,
                 is_rate: v.is_rate,
+                present: v.present,
             })
             .collect();
         summaries.push(kube::PodMetricSummary {

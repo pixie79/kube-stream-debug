@@ -210,6 +210,13 @@ pub struct MetricLine {
     /// Whether the value is a per-scrape rate (counter), for a "/s" suffix.
     #[serde(default)]
     pub is_rate: bool,
+    /// False when the scrape returned no sample — rendered as "(no data)".
+    #[serde(default = "default_present")]
+    pub present: bool,
+}
+
+fn default_present() -> bool {
+    true
 }
 
 /// The curated metric summary for one pod.

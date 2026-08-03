@@ -255,6 +255,14 @@ fn draw(f: &mut ratatui::Frame, state: &ViewState, frame: &Frame) {
 /// yellow worsening or stalled (higher-better at 0), green improving, dim gray
 /// when flat and healthy (so the eye skips the noise and lands on what matters).
 fn metric_line_spans(line: &crate::kube::MetricLine) -> Vec<Span<'static>> {
+    // Configured but not returned by the scrape → show it, dimmed, so the
+    // operator sees what's missing rather than it silently vanishing.
+    if !line.present {
+        return vec![Span::styled(
+            format!("{}=(no data)", line.label),
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+        )];
+    }
     let style = if line.breached {
         Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD)
     } else if line.worsening || line.stalled {
@@ -379,6 +387,7 @@ fn draw_metrics(f: &mut ratatui::Frame, area: Rect, frame: &Frame) {
             let uniform = vals.len() == rows.len()
                 && vals.iter().all(|l| {
                     (l.value - vals[0].value).abs() < f64::EPSILON
+                        && l.present == vals[0].present
                         && !l.breached
                         && !l.worsening
                         && !l.stalled

@@ -240,6 +240,11 @@ pub struct MetricVerdict {
     /// isn't moving. Notable even without a configured threshold: for a
     /// throughput metric, 0 is the alarming case, not the neutral one.
     pub stalled: bool,
+    /// False when the scrape returned no sample for this configured metric — the
+    /// pod isn't exposing it (or it's named differently). Rendered as "(no
+    /// data)" so a configured-but-absent metric is visible, not silently
+    /// dropped.
+    pub present: bool,
 }
 
 /// Whether a direction is "bad" given the metric's polarity.
@@ -404,18 +409,34 @@ impl MetricHistory {
         }
     }
 
-    /// Produce a verdict per watched metric that has data, ordered worst-first
-    /// (threshold breaches, then worsening, then flat, then improving) so the
-    /// summary leads with the problems.
+    /// Produce a verdict per watched metric, ordered worst-first (threshold
+    /// breaches, then worsening/stalled, then flat, then improving). A configured
+    /// metric the scrape never returned gets a `present = false` verdict so it's
+    /// shown as "(no data)" rather than silently dropped.
     pub fn verdicts(&self, specs: &[MetricSpec], eps: f64) -> Vec<MetricVerdict> {
         let mut out = Vec::new();
         for spec in specs {
-            let Some(series) = self.series.get(&spec.name) else {
+            // No series (or no sample yet) → emit a "no data" verdict.
+            let series = self.series.get(&spec.name);
+            let current = series.and_then(|s| s.current());
+            let Some(value) = current else {
+                out.push(MetricVerdict {
+                    label: spec.label.clone(),
+                    value: 0.0,
+                    instant: Direction::Flat,
+                    rolling: Direction::Flat,
+                    worsening: false,
+                    improving: false,
+                    breached: false,
+                    is_rate: spec.kind == MetricKind::Counter,
+                    category: spec.category,
+                    changed: false,
+                    stalled: false,
+                    present: false,
+                });
                 continue;
             };
-            let Some(value) = series.current() else {
-                continue;
-            };
+            let series = series.expect("series present when current() is Some");
             let instant = series.instant_direction(eps);
             let rolling = series.rolling_direction(eps);
             // Counters are shown as a per-scrape rate (the cumulative total is
@@ -450,11 +471,15 @@ impl MetricHistory {
                 category: spec.category,
                 changed,
                 stalled,
+                present: true,
             });
         }
-        // Worst-first: breach, then worsening/stalled, then flat, then improving.
+        // Worst-first: breach, then worsening/stalled, then flat, then improving,
+        // then absent (no data) last.
         out.sort_by_key(|v| {
-            if v.breached {
+            if !v.present {
+                4
+            } else if v.breached {
                 0
             } else if v.worsening || v.stalled {
                 1
@@ -474,6 +499,10 @@ pub fn format_summary(pod: &str, verdicts: &[MetricVerdict]) -> String {
     let mut out = String::new();
     let _ = write!(out, "metrics[{pod}]:");
     for v in verdicts {
+        if !v.present {
+            let _ = write!(out, " {}=(no data)", v.label);
+            continue;
+        }
         // Arrow only when the value moved.
         let arrow = if v.changed {
             match v.rolling {
@@ -810,6 +839,41 @@ ssync_pipeline_unhealthy 0";
     }
 
     #[test]
+    fn absent_metric_emits_no_data_verdict() {
+        // Configure two metrics; scrape returns only one. The absent one still
+        // gets a verdict, marked not-present.
+        let specs = vec![
+            MetricSpec {
+                name: "ssync_present_one".into(),
+                label: "present".into(),
+                polarity: Polarity::LowerBetter,
+                threshold: None,
+                kind: MetricKind::Gauge,
+                category: MetricCategory::Health,
+            },
+            MetricSpec {
+                name: "ssync_missing_one".into(),
+                label: "missing".into(),
+                polarity: Polarity::LowerBetter,
+                threshold: None,
+                kind: MetricKind::Gauge,
+                category: MetricCategory::Health,
+            },
+        ];
+        let mut h = MetricHistory::default();
+        let samples = vec![Sample { name: "ssync_present_one".into(), labels: vec![], value: 5.0 }];
+        h.update(&samples, &specs, 5);
+        let v = h.verdicts(&specs, 0.01);
+        assert_eq!(v.len(), 2, "both configured metrics get a verdict");
+        let present = v.iter().find(|x| x.label == "present").unwrap();
+        assert!(present.present);
+        let missing = v.iter().find(|x| x.label == "missing").unwrap();
+        assert!(!missing.present, "absent metric marked not present");
+        // Absent sorts after present.
+        assert_eq!(v.last().unwrap().label, "missing");
+    }
+
+    #[test]
     fn higher_better_at_zero_is_stalled() {
         let specs = vec![MetricSpec {
             name: "ssync_throughput_rate".into(),
@@ -844,6 +908,7 @@ ssync_pipeline_unhealthy 0";
             category: MetricCategory::Consumer,
             changed: true,
             stalled: false,
+            present: true,
         }];
         let s = format_summary("pod-a", &verdicts);
         assert!(s.contains("metrics[pod-a]"));
