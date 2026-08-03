@@ -41,3 +41,45 @@ selector  = "app=my-consumer"
 configmap = "my-consumer-config"
 log_tail  = 200
 assert    = { worker_count = "24", batch_size = "30" }
+
+# Optional operational defaults, so a frequently-run configuration doesn't need
+# a long command line. Every field is optional; a CLI flag overrides the config
+# value. The mode switches (watch/tui/problems_only) can be turned on here or by
+# the flag, but neither can force them off.
+[settings]
+format             = "table"          # or "jsonl"
+concurrency        = 8
+timeout_secs       = 30
+drain_window_secs  = 30               # 0 skips the trend/ETA second sample
+watch              = false
+tui                = false
+watch_interval_secs = 60
+json_dir           = "./snapshots"
+json_dir_max_files = 100              # 0 keeps all
+problems_only      = false
+
+# Optional pod-metrics scraping (requires --kube / the kube feature). When
+# enabled, the tool port-forwards to each consumer pod's metrics port, parses
+# the Prometheus /metrics, tracks rolling trends, and logs a curated per-pod
+# summary each cycle. Set capture_dir to also archive every scraped metric as
+# JSONL for later tuning.
+[metrics]
+enabled     = false
+port        = 9090
+window      = 5                       # scrapes kept per metric for rolling trend
+# capture_dir = "./metrics-capture"   # unset = summarise live, don't archive
+
+# Optionally choose exactly which metrics to monitor. Listing any [[metrics.watch]]
+# entries REPLACES the built-in curated set; omit them to use the defaults.
+# polarity: "lower_better" | "higher_better" | "neutral". threshold (optional)
+# alerts when crossed — above for lower_better, below for higher_better.
+# [[metrics.watch]]
+# name      = "ssync_pulsar_consumer_lag"
+# polarity  = "lower_better"
+# threshold = 100000
+# label     = "consumer lag"
+#
+# [[metrics.watch]]
+# name      = "ssync_throughput_rate"
+# polarity  = "higher_better"
+# threshold = 50
