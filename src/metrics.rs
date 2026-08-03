@@ -183,11 +183,6 @@ impl Series {
 
     /// Rate of change per sample for a counter (current minus previous). Returns
     /// None if fewer than two samples, or if the counter reset (went down).
-    ///
-    /// Part of the public series API for consumers of the rolling history — the
-    /// per-stage throughput counters (`*_total`) are most meaningfully read as a
-    /// rate, which the offline tuning analysis over the JSONL capture uses.
-    #[allow(dead_code)]
     pub fn counter_rate(&self) -> Option<f64> {
         match (self.current(), self.previous()) {
             (Some(cur), Some(prev)) if cur >= prev => Some(cur - prev),
@@ -232,6 +227,9 @@ pub struct MetricVerdict {
     /// True when an alert threshold was configured and the value has crossed it
     /// in the bad direction (above for lower-better, below for higher-better).
     pub breached: bool,
+    /// True when `value` is a per-scrape rate (counter) rather than a gauge
+    /// reading, so the display can mark it (e.g. a "/s" label suffix).
+    pub is_rate: bool,
 }
 
 /// Whether a direction is "bad" given the metric's polarity.
@@ -263,6 +261,23 @@ fn threshold_breached(value: f64, threshold: Option<f64>, pol: Polarity) -> bool
     }
 }
 
+/// Whether a metric is a cumulative counter (shown as a per-scrape rate) or an
+/// instantaneous gauge (shown as its current value). Counters like the per-stage
+/// `*_total` throughput are meaningless as a raw cumulative number — the rate is
+/// what localises a bottleneck.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MetricKind {
+    Gauge,
+    Counter,
+}
+
+impl Default for MetricKind {
+    fn default() -> Self {
+        MetricKind::Gauge
+    }
+}
+
 /// A metric to monitor: name, a human label, its polarity, and an optional
 /// alert threshold. Produced either from the built-in curated defaults or from
 /// the operator's `[[metrics.watch]]` config.
@@ -272,6 +287,7 @@ pub struct MetricSpec {
     pub label: String,
     pub polarity: Polarity,
     pub threshold: Option<f64>,
+    pub kind: MetricKind,
 }
 
 /// The built-in curated specs, used when the operator hasn't configured their
@@ -279,42 +295,45 @@ pub struct MetricSpec {
 pub fn default_specs() -> Vec<MetricSpec> {
     curated_series()
         .iter()
-        .map(|(name, label, pol)| MetricSpec {
+        .map(|(name, label, pol, kind)| MetricSpec {
             name: (*name).to_string(),
             label: (*label).to_string(),
             polarity: *pol,
             threshold: None,
+            kind: *kind,
         })
         .collect()
 }
 
-/// The curated set of series to summarise, each with a human label and polarity.
-/// Names are matched by prefix so a labelled series (e.g. per-topic lag)
-/// aggregates under one entry. This is the "consumer health / sync health /
-/// throughput / bottleneck" view over the ~200 exposed metrics.
-pub fn curated_series() -> &'static [(&'static str, &'static str, Polarity)] {
+/// The curated set of series to summarise, each with a human label, polarity,
+/// and kind (counter vs gauge). Names are matched so a labelled series (e.g.
+/// per-topic lag) aggregates under one entry. This is the "consumer health /
+/// throughput / bottleneck" view over the ~200 exposed metrics. `*_total`
+/// counters are marked Counter so they're shown as a per-scrape rate.
+pub fn curated_series() -> &'static [(&'static str, &'static str, Polarity, MetricKind)] {
+    use MetricKind::{Counter, Gauge};
     &[
         // Consumer health.
-        ("ssync_pulsar_consumer_lag", "consumer lag", Polarity::LowerBetter),
-        ("ssync_pulsar_backlog_bytes", "backlog bytes", Polarity::LowerBetter),
-        ("ssync_pulsar_unacked_messages", "unacked", Polarity::LowerBetter),
-        ("ssync_pulsar_reconnections", "reconnections", Polarity::LowerBetter),
-        ("ssync_source_partitions_idle", "idle partitions", Polarity::LowerBetter),
-        // Throughput (per stage).
-        ("ssync_throughput_rate", "throughput rps", Polarity::HigherBetter),
-        ("ssync_source_records_consumed_total", "consumed", Polarity::HigherBetter),
-        ("ssync_records_written_total", "written", Polarity::HigherBetter),
-        ("ssync_sink_records_sent_total", "sink sent", Polarity::HigherBetter),
+        ("ssync_pulsar_consumer_lag", "consumer lag", Polarity::LowerBetter, Gauge),
+        ("ssync_pulsar_backlog_bytes", "backlog bytes", Polarity::LowerBetter, Gauge),
+        ("ssync_pulsar_unacked_messages", "unacked", Polarity::LowerBetter, Gauge),
+        ("ssync_pulsar_reconnections", "reconnections", Polarity::LowerBetter, Gauge),
+        ("ssync_source_partitions_idle", "idle partitions", Polarity::LowerBetter, Gauge),
+        // Throughput (per stage) — counters shown as a rate.
+        ("ssync_throughput_rate", "throughput rps", Polarity::HigherBetter, Gauge),
+        ("ssync_source_records_consumed_total", "consumed/s", Polarity::HigherBetter, Counter),
+        ("ssync_records_written_total", "written/s", Polarity::HigherBetter, Counter),
+        ("ssync_sink_records_sent_total", "sink sent/s", Polarity::HigherBetter, Counter),
         // Bottleneck detection — channel depths/fill.
-        ("ssync_source_channel_fill_ratio", "source chan fill", Polarity::LowerBetter),
-        ("ssync_decoded_channel_depth", "decoded chan depth", Polarity::LowerBetter),
-        ("ssync_batcher_channel_depth", "batcher chan depth", Polarity::LowerBetter),
-        ("ssync_writer_channel_fill_ratio", "writer chan fill", Polarity::LowerBetter),
+        ("ssync_source_channel_fill_ratio", "source chan fill", Polarity::LowerBetter, Gauge),
+        ("ssync_decoded_channel_depth", "decoded chan depth", Polarity::LowerBetter, Gauge),
+        ("ssync_batcher_channel_depth", "batcher chan depth", Polarity::LowerBetter, Gauge),
+        ("ssync_writer_channel_fill_ratio", "writer chan fill", Polarity::LowerBetter, Gauge),
         // Health / pressure.
-        ("ssync_backpressure_state", "backpressure", Polarity::LowerBetter),
-        ("ssync_memory_rss_ratio", "mem rss ratio", Polarity::LowerBetter),
-        ("ssync_pipeline_unhealthy", "unhealthy", Polarity::LowerBetter),
-        ("ssync_destination_dlq_rows_total", "dlq rows", Polarity::LowerBetter),
+        ("ssync_backpressure_state", "backpressure", Polarity::LowerBetter, Gauge),
+        ("ssync_memory_rss_ratio", "mem rss ratio", Polarity::LowerBetter, Gauge),
+        ("ssync_pipeline_unhealthy", "unhealthy", Polarity::LowerBetter, Gauge),
+        ("ssync_destination_dlq_rows_total", "dlq rows/s", Polarity::LowerBetter, Counter),
     ]
 }
 
@@ -366,15 +385,27 @@ impl MetricHistory {
             };
             let instant = series.instant_direction(eps);
             let rolling = series.rolling_direction(eps);
-            let breached = threshold_breached(value, spec.threshold, spec.polarity);
+            // Counters are shown as a per-scrape rate (the cumulative total is
+            // meaningless to watch); gauges as their current value. A counter
+            // with only one sample (no rate yet) falls back to 0 rate.
+            let is_rate = spec.kind == MetricKind::Counter;
+            let display_value = if is_rate {
+                series.counter_rate().unwrap_or(0.0)
+            } else {
+                value
+            };
+            // Threshold is checked against the displayed value (the rate for a
+            // counter, so a "writes/s below N" alert works as expected).
+            let breached = threshold_breached(display_value, spec.threshold, spec.polarity);
             out.push(MetricVerdict {
                 label: spec.label.clone(),
-                value,
+                value: display_value,
                 instant,
                 rolling,
                 worsening: is_worsening(rolling, spec.polarity),
                 improving: is_improving(rolling, spec.polarity),
                 breached,
+                is_rate,
             });
         }
         // Worst-first: a threshold breach outranks a mere worsening trend.
@@ -539,6 +570,34 @@ mod tests {
     }
 
     #[test]
+    fn counter_metrics_shown_as_rate() {
+        // A counter spec: verdict value should be the per-scrape delta, not the
+        // cumulative total.
+        let specs = vec![MetricSpec {
+            name: "ssync_records_written_total".into(),
+            label: "written/s".into(),
+            polarity: Polarity::HigherBetter,
+            threshold: Some(100.0),
+            kind: MetricKind::Counter,
+        }];
+        let mut h = MetricHistory::default();
+        // Cumulative totals 1000 → 1150 → 1300: rate is 150/scrape.
+        for total in [1000.0, 1150.0, 1300.0] {
+            let samples = vec![Sample {
+                name: "ssync_records_written_total".into(),
+                labels: vec![],
+                value: total,
+            }];
+            h.update(&samples, &specs, 5);
+        }
+        let v = h.verdicts(&specs, 0.01);
+        let written = v.iter().find(|x| x.label == "written/s").unwrap();
+        assert!(written.is_rate, "counter should be flagged as a rate");
+        assert_eq!(written.value, 150.0, "value should be the per-scrape rate");
+        assert!(!written.breached, "150/s is above the 100 floor");
+    }
+
+    #[test]
     fn parses_labeled_and_bare_lines() {
         let text = "\
 # HELP ssync_throughput_rate rps
@@ -645,12 +704,14 @@ ssync_pipeline_unhealthy 0";
                 label: "lag".into(),
                 polarity: Polarity::LowerBetter,
                 threshold: Some(1000.0),
+                kind: MetricKind::Gauge,
             },
             MetricSpec {
                 name: "ssync_throughput_rate".into(),
                 label: "tput".into(),
                 polarity: Polarity::HigherBetter,
                 threshold: Some(100.0),
+                kind: MetricKind::Gauge,
             },
         ];
         let mut h = MetricHistory::default();
@@ -703,6 +764,7 @@ ssync_pipeline_unhealthy 0";
             worsening: true,
             improving: false,
             breached: false,
+            is_rate: false,
         }];
         let s = format_summary("pod-a", &verdicts);
         assert!(s.contains("metrics[pod-a]"));

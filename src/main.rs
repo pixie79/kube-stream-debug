@@ -648,6 +648,10 @@ fn watch_specs(metrics_config: &config::MetricsConfig) -> Vec<metrics::MetricSpe
                 config::MetricPolarity::Neutral => metrics::Polarity::Neutral,
             },
             threshold: w.threshold,
+            kind: match w.kind {
+                config::MetricKind::Gauge => metrics::MetricKind::Gauge,
+                config::MetricKind::Counter => metrics::MetricKind::Counter,
+            },
         })
         .collect()
 }

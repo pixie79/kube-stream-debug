@@ -124,6 +124,19 @@ pub struct WatchMetric {
     /// Display name in the summary; defaults to `name` when unset.
     #[serde(default)]
     pub label: Option<String>,
+    /// Whether this is a cumulative counter (shown as a per-scrape rate) or a
+    /// gauge (shown as its current value). Defaults to gauge.
+    #[serde(default)]
+    pub kind: MetricKind,
+}
+
+/// Whether a watched metric is a counter or a gauge (see metrics module).
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MetricKind {
+    #[default]
+    Gauge,
+    Counter,
 }
 
 /// Which direction of movement is bad for a metric.
