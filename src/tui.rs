@@ -199,6 +199,10 @@ fn ui_loop(
 }
 
 fn draw(f: &mut ratatui::Frame, state: &ViewState, frame: &Frame) {
+    // Clear the entire frame first. Some views (notably the sparse metrics
+    // summary and the header) don't paint every cell, so without a full clear,
+    // characters from a previous, longer frame bleed through the gaps.
+    f.render_widget(Clear, f.area());
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
