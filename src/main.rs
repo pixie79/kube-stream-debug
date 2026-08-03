@@ -276,19 +276,18 @@ fn run_tui(
                     &mut metrics_tracker,
                     metrics_config.capture_dir.as_deref(),
                     &run_at,
+                    false, // TUI owns the screen — don't eprintln over it.
                 );
             }
         }
 
         // Persist the snapshot, same as watch mode — otherwise --json-dir is
         // silently ignored in --tui. Written before any display filtering so the
-        // on-disk history is complete.
-        if let Some(dir) = &cli.json_dir
-            && let Err(err) =
-                snapshot::write_snapshot(dir, &results, &run_at, cli.json_dir_max_files())
-            {
-                eprintln!("Warning: {err}");
-            }
+        // on-disk history is complete. A write error is swallowed here rather
+        // than eprintln'd, which would corrupt the ratatui screen.
+        if let Some(dir) = &cli.json_dir {
+            let _ = snapshot::write_snapshot(dir, &results, &run_at, cli.json_dir_max_files());
+        }
 
         tui::Frame {
             run_at,
@@ -468,6 +467,7 @@ fn watch_loop(
                     &mut metrics_tracker,
                     metrics_config.capture_dir.as_deref(),
                     &run_at,
+                    true, // plain watch mode — stderr summary is fine.
                 );
             }
         }
@@ -671,6 +671,7 @@ fn process_metrics(
     tracker: &mut metrics::MetricsTracker,
     capture_dir: Option<&std::path::Path>,
     run_at: &str,
+    log: bool,
 ) {
     const EPS: f64 = 0.02; // 2% change threshold for flat.
     // Collect (pod, text, health) first so we can then borrow report mutably to
@@ -683,9 +684,11 @@ fn process_metrics(
 
     let mut summaries = Vec::with_capacity(scraped.len());
     for (pod, text, health) in &scraped {
-        // Fold into the rolling tracker and log the one-line summary.
+        // Fold into the rolling tracker and (outside the TUI) log the summary.
         let summary = tracker.observe(pod, text, EPS);
-        eprintln!("{summary}");
+        if log {
+            eprintln!("{summary}");
+        }
 
         // Build the structured per-pod summary for the TUI from the verdicts.
         let verdicts = tracker.verdicts_for(pod, EPS);
@@ -716,7 +719,9 @@ fn process_metrics(
             let samples = metrics::parse_prometheus(text);
             let record = metrics::capture_record(run_at, pod, &samples);
             if let Err(e) = append_capture(dir, pod, &record) {
-                eprintln!("Warning: metrics capture failed: {e}");
+                if log {
+                    eprintln!("Warning: metrics capture failed: {e}");
+                }
             }
         }
     }
