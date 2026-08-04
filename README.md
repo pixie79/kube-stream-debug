@@ -54,10 +54,12 @@ The tool includes a full-screen interactive terminal UI that refreshes live and 
 pulsar-topic-health --tui
 ```
 
-Three views, cycled with `v`:
+Five views, cycled with `v`:
 
 - **topic** — the classic per-topic table, with a cursor you move with ↑/↓. TREND and ETA columns appear once drain data is available (from the second refresh onward, or with `--drain-window-secs`).
 - **kube** — the Kubernetes pod-and-node health (populated when also built and run with `--kube`).
+- **metrics** — a fleet-wide summary of scraped pod metrics (see [Pod metrics](#pod-metrics-scraping-optional)), grouped by category (consumer / throughput / bottleneck / health), with a per-pod pipeline flow line, per-stage rates, and trend/stall/breach colouring. Scrollable with ↑/↓ and PgUp/PgDn.
+- **stability** — per-pod connection-stability detection: reconnect/cull rate, active-partition churn, and a flapping verdict, to catch consumers stuck in an idle→cull→rebalance→reconnect loop.
 - **combined** — a split screen: topics on top, and the partitions of the topic you've drilled into on the bottom.
 
 Navigating and drilling in:
@@ -65,8 +67,8 @@ Navigating and drilling in:
 - **↑/↓** (or `k`/`j`) move the cursor between topics.
 - **Enter** on the selected topic drills into it — switches to the combined view with that topic's partitions in the lower pane. (This replaces a standalone partition list — drill into the topic you care about instead.)
 - **Esc** backs out of the drill-in to the topic view.
-- In the **kube** view, **Tab** switches the cursor between the pods and nodes sections; **Enter** opens detail for the selected pod (its resource breakdown and logs) or node (its capacity and which pods run on it). In pod-detail, the logs are a scannable one-line-per-entry list: **↑/↓** select a line, **Enter** expands it to a pretty-printed, wrapped view (timestamp, level, message, error, and the remaining fields) so you can read the whole thing — **Esc** collapses back, **w** toggles wrapping. The kube panel also shows a live log-stats summary (level counts, RSS trend, throughput, operational tallies, top messages).
-- **?** toggles a legend overlay explaining every status and trend.
+- In the **kube** view, **Tab** switches the cursor between the pods and nodes sections; **Enter** opens detail for the selected pod (its resource breakdown and logs) or node (its capacity and which pods run on it). In pod-detail, the logs are a scannable one-line-per-entry list: **↑/↓** select a line, **Enter** expands it to a pretty-printed, wrapped view (timestamp, level, message, error, and the remaining fields) so you can read the whole thing — **Esc** collapses back, **w** toggles wrapping, **m** toggles the lower pane between the pod's logs and its scraped metrics. The kube panel also shows a live log-stats summary (level counts, RSS trend, throughput, operational tallies, top messages).
+- **?** toggles a legend overlay explaining every status and trend (and, when admin actions are enabled, the action keys).
 - **r** refreshes now, **q** (or Ctrl-C) quits.
 
 The refresh cadence uses `--watch-interval-secs`, and drain trend is derived from consecutive refreshes just like `--watch`. Refreshing happens on a background thread, so switching views is instant and the fetch never freezes the UI — the screen always shows the most recent data and updates in place when the next refresh lands. The kube view has data when the binary is also built with `--features kube` and run with `--kube`.
@@ -140,6 +142,64 @@ If a pod's logs show a **transform / data-quality / DLQ error** — a DataFusion
 The same escalation applies to the other signals that precede an outage but are easy to miss in a wall of logs — the transitions and thresholds, not just the raw numbers. A **pre-OOM memory warning** (RSS crossing the cgroup limit, "OOM kill imminent") shows a red `MEM-CRITICAL` pod state and a banner — caught *before* the kernel kills the pod, while it's still savable (it ranks above `OOMKilled`, which has already happened). A **throughput collapse** — a pod that was processing and dropped to zero, distinct from one idle since start — raises a banner. A **reconnect storm** (a burst of broker-closed/disconnect/TLS-EOF events over one window, not incidental churn) and **backpressure** (an internal channel near-full, which precedes a stall) are flagged and tallied. All are detected from the scanned pod logs and shown in both the plain output and the TUI kube panel.
 
 The Kubernetes side is strictly best-effort and isolated: if the cluster is unreachable or auth fails, the tool prints an `unreachable` notice and still renders the full Pulsar report. A consumer-side problem (failed pods, failed config assertion, split rollout) contributes to the non-zero exit code alongside topic health, so `--kube` works as a post-deploy gate.
+
+## Pod metrics scraping (optional)
+
+When the consumer pods expose Prometheus `/metrics`, the tool can port-forward to each pod, parse the metrics, track rolling trends, and surface a curated per-pod summary — turning "the pipeline is slow" into "the batch stage is backed up on these two pods". It's part of the `kube` feature and is enabled in config:
+
+```toml
+[metrics]
+enabled     = true
+port        = 9090       # the pod's metrics port
+window      = 5          # scrapes kept per metric for the rolling trend
+# capture_dir = "./metrics-capture"   # also archive every scraped metric as JSONL
+```
+
+By default a built-in curated set is summarised. To choose exactly which metrics to watch, list `[[metrics.watch]]` entries — doing so replaces the defaults:
+
+```toml
+[[metrics.watch]]
+name      = "myapp_records_written_total"
+label     = "written/s"
+kind      = "counter"          # counters are shown as a per-scrape rate
+polarity  = "higher_better"    # lower_better | higher_better | neutral
+threshold = 100                # optional; alerts when crossed
+category  = "throughput"       # consumer | throughput | bottleneck | health
+```
+
+Notes on matching and display:
+
+- **Exporter suffixes are tolerated.** A configured `myapp_x` matches the pod's `myapp_x_total`, `myapp_x_bytes`, `myapp_x_total_total`, etc. — the type/unit suffixes a Prometheus/OpenTelemetry exporter appends. Histogram component series (`_bucket`/`_count`/`_sum`) are excluded.
+- **Counters are shown as rates**, not their meaningless cumulative total, so the per-stage throughput reads directly.
+- **A configured metric the pod doesn't expose shows as dimmed `(no data)`** rather than silently vanishing, so you can tell "healthy zero" from "not found".
+- In the **metrics** TUI view, each pod leads with a pipeline flow line (`consumed → written → sink`); identical values across pods collapse to one line; pods not scraped this cycle are summarised compactly; a higher-better metric sitting at zero is flagged as stalled.
+
+## Connection stability (optional)
+
+Built on the same scrape, the **stability** view detects consumers stuck in an idle→cull→rebalance→reconnect loop — a pattern no single snapshot reveals. Per pod it shows the idle-cull rate, reconnect rate, active-partition count, and active-partition *churn* (total variation across the window, which catches an oscillation like 90→0→90→0 that a net-delta check misses), with a flapping verdict. When the pipeline exposes a labelled consumer-cull counter (`<prefix>_source_consumers_culled_total{reason="idle_timeout"}`) and an idle-cull threshold gauge, the view reads the idle-timeout culls specifically and shows the threshold, so a loop caused by an idle timeout set too tight is obvious.
+
+## Admin actions (optional, off by default)
+
+The tool is read-only unless you explicitly opt in. When enabled, the TUI can perform a few targeted remediations against the consumer pods, behind **two gates**:
+
+1. **Config gate.** Nothing is possible unless the config enables it:
+
+   ```toml
+   [admin]
+   allow_actions = true
+   ```
+
+   With this `false` (the default) or absent, the action keys are inert and the tool stays strictly read-only.
+
+2. **Live confirmation.** Even when enabled, every action shows a confirmation prompt naming the exact target and only fires on an explicit `y`. There is no way to pre-authorise or skip the confirmation.
+
+The actions, from the **kube** or **pod-detail** views:
+
+- **d** — delete the selected pod (its controller recreates it — a targeted restart).
+- **R** — rolling-recycle *all* consumer pods: delete one, wait for its replacement to become Ready, then the next; stops on any failure so it never takes down more than one at a time.
+- **D** — cordon and drain the selected pod's node (evicts its pods, skipping DaemonSet-owned ones).
+
+Admin actions require the `kube` feature. The keys are listed in the `?` legend when enabled.
 
 ## Watch mode
 

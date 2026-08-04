@@ -555,19 +555,19 @@ mod tests {
             [metrics]
             enabled = true
             [[metrics.watch]]
-            name = "ssync_pulsar_consumer_lag"
+            name = "myapp_pulsar_consumer_lag"
             polarity = "lower_better"
             threshold = 100000
             label = "consumer lag"
             [[metrics.watch]]
-            name = "ssync_throughput_rate"
+            name = "myapp_throughput_rate"
             polarity = "higher_better"
             threshold = 50
             "#,
         )
         .expect("watch list should parse");
         assert_eq!(config.metrics.watch.len(), 2);
-        assert_eq!(config.metrics.watch[0].name, "ssync_pulsar_consumer_lag");
+        assert_eq!(config.metrics.watch[0].name, "myapp_pulsar_consumer_lag");
         assert_eq!(config.metrics.watch[0].polarity, MetricPolarity::LowerBetter);
         assert_eq!(config.metrics.watch[0].threshold, Some(100000.0));
         assert_eq!(config.metrics.watch[0].label.as_deref(), Some("consumer lag"));

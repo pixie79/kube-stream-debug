@@ -74,12 +74,12 @@ window      = 5                       # scrapes kept per metric for rolling tren
 # polarity: "lower_better" | "higher_better" | "neutral". threshold (optional)
 # alerts when crossed — above for lower_better, below for higher_better.
 # [[metrics.watch]]
-# name      = "ssync_pulsar_consumer_lag"
+# name      = "myapp_pulsar_consumer_lag"
 # polarity  = "lower_better"
 # threshold = 100000
 # label     = "consumer lag"
 #
 # [[metrics.watch]]
-# name      = "ssync_throughput_rate"
+# name      = "myapp_throughput_rate"
 # polarity  = "higher_better"
 # threshold = 50

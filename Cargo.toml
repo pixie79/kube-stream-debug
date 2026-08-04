@@ -1,6 +1,6 @@
 [package]
 name = "pulsar-topic-health"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.94"
 description = "Topic-level health summary for Pulsar subscriptions: backlog thresholds, missing subscriptions, per-partition detail"
@@ -12,19 +12,19 @@ clap = { version = "4.5", features = ["derive", "env"] }
 comfy-table = "7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-thiserror = "1"
-toml = "0.8"
-ureq = { version = "2.10", features = ["json"] }
+thiserror = "2"
+toml = "1"
+ureq = { version = "3", features = ["json"] }
 
 # Interactive TUI, always compiled in. The event loop lives in src/tui.rs;
 # the pure view-state logic in src/view.rs is unit-tested.
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 
 # Optional Kubernetes correlation. Off by default so the base tool doesn't
 # require kube-rs + tokio; enable with `--features kube`.
-kube = { version = "0.99", default-features = false, features = ["client", "rustls-tls", "config", "ws"], optional = true }
-k8s-openapi = { version = "0.24", features = ["latest"], optional = true }
+kube = { version = "4", default-features = false, features = ["client", "rustls-tls", "aws-lc-rs", "config", "ws"], optional = true }
+k8s-openapi = { version = "0.28", features = ["latest"], optional = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util"], optional = true }
 futures = { version = "0.3", optional = true }
 
