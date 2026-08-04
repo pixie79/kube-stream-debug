@@ -200,11 +200,6 @@ impl Series {
             .map(|w| (w[1] - w[0]).abs())
             .sum()
     }
-
-    /// Number of samples currently held.
-    pub fn len(&self) -> usize {
-        self.values.len()
-    }
 }
 
 fn mean(xs: &[f64]) -> f64 {
@@ -509,7 +504,9 @@ pub struct PodStability {
 }
 
 impl PodStability {
-    /// Whether this pod shows any instability signal.
+    /// Whether this pod shows any instability signal. Used by the stability
+    /// tests; the TUI computes the verdict inline on the report's mirror type.
+    #[allow(dead_code)]
     pub fn unstable(&self) -> bool {
         self.flapping_rate || self.flapping_rebalance || self.idle_cull_loop
     }
