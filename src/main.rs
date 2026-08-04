@@ -228,9 +228,10 @@ fn run() -> anyhow::Result<ExitCode> {
     let colors = config.colors;
     let kube_config = config.kube;
     let metrics_config = config.metrics;
+    let admin_config = config.admin;
 
     if cli.tui {
-        return run_tui(&cli, &kube_config, &metrics_config, &client, &topics, &subscription, threshold);
+        return run_tui(&cli, &kube_config, &metrics_config, &admin_config, &client, &topics, &subscription, threshold);
     }
     if cli.watch {
         watch_loop(&cli, &colors, &kube_config, &metrics_config, &client, &topics, &subscription, threshold)
@@ -244,6 +245,7 @@ fn run_tui(
     cli: &Cli,
     kube_config: &config::KubeConfig,
     metrics_config: &config::MetricsConfig,
+    admin_config: &config::AdminConfig,
     client: &AdminClient,
     topics: &[TopicName],
     subscription: &str,
@@ -301,8 +303,71 @@ fn run_tui(
         }
     };
 
-    tui::run(Box::new(refresh), Duration::from_secs(cli.watch_interval_secs().max(1)))?;
+    // Gate one: build an action executor ONLY if admin.allow_actions is true.
+    // When None, the TUI's action keys are inert — the tool stays read-only.
+    let executor = build_executor(admin_config);
+
+    tui::run(
+        Box::new(refresh),
+        Duration::from_secs(cli.watch_interval_secs().max(1)),
+        executor,
+    )?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// Build the destructive-action executor for the TUI. Returns `Some` only when
+/// `admin.allow_actions` is true (gate one). The closure blocks on the async
+/// kube action in a short-lived runtime and returns a result message.
+#[cfg(feature = "kube")]
+fn build_executor(admin_config: &config::AdminConfig) -> Option<Box<tui::Executor<'static>>> {
+    if !admin_config.allow_actions {
+        return None;
+    }
+    Some(Box::new(move |action: view::PendingAction| {
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(rt) => rt,
+            Err(e) => return format!("failed to start runtime: {e}"),
+        };
+        rt.block_on(async move {
+            use view::PendingAction as A;
+            match action {
+                A::DeletePod { namespace, pod } => {
+                    kube::actions::delete_pod(&namespace, &pod).await.message().to_string()
+                }
+                A::RecycleAll { namespace, selector } => {
+                    let outcomes = kube::actions::recycle_all(
+                        &namespace,
+                        &selector,
+                        std::time::Duration::from_secs(120),
+                    )
+                    .await;
+                    summarize_outcomes(&outcomes)
+                }
+                A::CordonDrainNode { node } => {
+                    summarize_outcomes(&kube::actions::cordon_drain_node(&node).await)
+                }
+            }
+        })
+    }))
+}
+
+/// With the kube feature off, there are no actions to execute.
+#[cfg(not(feature = "kube"))]
+fn build_executor(_admin_config: &config::AdminConfig) -> Option<Box<tui::Executor<'static>>> {
+    None
+}
+
+/// Fold a multi-step action's outcomes into one status-line message: the first
+/// error if any step failed, else the last success.
+#[cfg(feature = "kube")]
+fn summarize_outcomes(outcomes: &[kube::actions::ActionOutcome]) -> String {
+    if let Some(err) = outcomes.iter().find(|o| !o.is_ok()) {
+        return err.message().to_string();
+    }
+    outcomes
+        .last()
+        .map(|o| o.message().to_string())
+        .unwrap_or_else(|| "no-op".to_string())
 }
 
 /// One-shot run: check, optionally take a mid-cycle drain sample, render, and

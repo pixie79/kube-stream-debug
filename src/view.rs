@@ -71,6 +71,36 @@ pub enum KubeFocus {
     Nodes,
 }
 
+/// A destructive action awaiting the operator's y/N confirmation (gate two).
+/// Carries exactly what's needed to perform it, captured when the key was
+/// pressed, so the prompt can name the specific target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingAction {
+    /// Delete a single pod (targeted restart).
+    DeletePod { namespace: String, pod: String },
+    /// Rolling-recycle every pod matching the selector.
+    RecycleAll { namespace: String, selector: String },
+    /// Cordon and drain a node.
+    CordonDrainNode { node: String },
+}
+
+impl PendingAction {
+    /// The confirmation-prompt text describing exactly what will happen.
+    pub fn prompt(&self) -> String {
+        match self {
+            PendingAction::DeletePod { pod, .. } => {
+                format!("Delete pod {pod}? It will be recreated by its controller. [y/N]")
+            }
+            PendingAction::RecycleAll { selector, .. } => {
+                format!("Rolling-recycle ALL pods matching {selector}, one at a time? [y/N]")
+            }
+            PendingAction::CordonDrainNode { node } => {
+                format!("Cordon and drain node {node} (evicts ALL its pods)? [y/N]")
+            }
+        }
+    }
+}
+
 /// Mutable UI state driven by keypresses. Navigation is a cursor (↑/↓) plus a
 /// drill-in focus (Enter on a topic scopes the combined view to it; Esc backs
 /// out). There is no text filter.
@@ -97,6 +127,12 @@ pub struct ViewState {
     pub pod_detail_metrics: bool,
     /// Vertical scroll offset (in lines) for the fleet metrics view.
     pub metrics_scroll: u16,
+    /// When set, a destructive action is awaiting y/N confirmation (gate two).
+    /// Even with admin.allow_actions=true nothing fires until the operator
+    /// confirms here. Cleared on y (fire) or n/Esc (cancel).
+    pub pending_action: Option<PendingAction>,
+    /// The last action's result message, shown in the status line after it runs.
+    pub last_action_result: Option<String>,
     /// When set, the node-detail view is showing this node.
     pub selected_node: Option<String>,
     /// Whether the status-legend help overlay is showing.
@@ -116,6 +152,8 @@ impl Default for ViewState {
             log_wrap: true,
             pod_detail_metrics: false,
             metrics_scroll: 0,
+            pending_action: None,
+            last_action_result: None,
             selected_node: None,
             show_help: false,
         }
@@ -372,6 +410,26 @@ pub fn partition_rows_for_topic(topics: &[TopicHealth], topic: &str) -> Vec<Part
 mod tests {
     use super::*;
     use crate::health::{PartitionDetail, Status, TopicHealth};
+
+    #[test]
+    fn pending_action_prompt_names_target() {
+        let del = PendingAction::DeletePod { namespace: "ns".into(), pod: "consumer-abc".into() };
+        assert!(del.prompt().contains("consumer-abc"));
+        assert!(del.prompt().contains("[y/N]"));
+        let recycle = PendingAction::RecycleAll { namespace: "ns".into(), selector: "app=consumer".into() };
+        assert!(recycle.prompt().contains("app=consumer"));
+        assert!(recycle.prompt().to_lowercase().contains("recycle"));
+        let drain = PendingAction::CordonDrainNode { node: "node-1".into() };
+        assert!(drain.prompt().contains("node-1"));
+        assert!(drain.prompt().to_lowercase().contains("drain"));
+    }
+
+    #[test]
+    fn confirmation_defaults_to_none() {
+        let state = ViewState::default();
+        assert!(state.pending_action.is_none());
+        assert!(state.last_action_result.is_none());
+    }
 
     fn topic_with_partitions(name: &str, parts: &[(u32, i64, &'static str)]) -> TopicHealth {
         let partitions = parts

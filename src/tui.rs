@@ -46,11 +46,22 @@ pub struct Frame {
 /// `Send`, so callers satisfy this naturally.
 pub type Refresh<'a> = dyn FnMut() -> Frame + Send + 'a;
 
+/// Executes a confirmed destructive action, returning a human-readable result.
+/// Provided by main (which owns the async runtime + kube client); `None` when
+/// actions are unavailable (kube feature off, or admin.allow_actions is false),
+/// in which case the action keys are inert. This is where gate one is enforced:
+/// main supplies an executor only when actions are permitted.
+pub type Executor<'a> = dyn FnMut(crate::view::PendingAction) -> String + 'a;
+
 /// Run the interactive TUI until the user quits. `interval` is the auto-refresh
-/// cadence.
-pub fn run(mut refresh: Box<Refresh<'_>>, interval: Duration) -> std::io::Result<()> {
+/// cadence. `executor` is `Some` only when destructive actions are permitted.
+pub fn run(
+    mut refresh: Box<Refresh<'_>>,
+    interval: Duration,
+    mut executor: Option<Box<Executor<'_>>>,
+) -> std::io::Result<()> {
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, refresh.as_mut(), interval);
+    let result = event_loop(&mut terminal, refresh.as_mut(), interval, executor.as_deref_mut());
     ratatui::restore();
     result
 }
@@ -65,6 +76,7 @@ fn event_loop(
     terminal: &mut DefaultTerminal,
     refresh: &mut Refresh<'_>,
     interval: Duration,
+    executor: Option<&mut Executor<'_>>,
 ) -> std::io::Result<()> {
     use std::sync::mpsc;
 
@@ -93,19 +105,22 @@ fn event_loop(
                 }
             }
         });
-        let ui_result = ui_loop(terminal, &mut state, &mut frame, &frame_rx, &cmd_tx);
+        let ui_result = ui_loop(terminal, &mut state, &mut frame, &frame_rx, &cmd_tx, executor);
         let _ = cmd_tx.send(RefreshCmd::Stop);
         ui_result
     })
 }
 
 /// The interactive UI loop: instant view switches, non-blocking frame updates.
+/// Runs on the main thread (the worker thread only runs `refresh`), so it holds
+/// the non-`Send` action executor.
 fn ui_loop(
     terminal: &mut DefaultTerminal,
     state: &mut ViewState,
     frame: &mut Frame,
     frame_rx: &std::sync::mpsc::Receiver<Frame>,
     cmd_tx: &std::sync::mpsc::Sender<RefreshCmd>,
+    mut executor: Option<&mut Executor<'_>>,
 ) -> std::io::Result<()> {
     loop {
         while let Ok(f) = frame_rx.try_recv() {
@@ -147,6 +162,28 @@ fn ui_loop(
                     0
                 };
 
+                // Confirmation intercept (gate two): while an action awaits
+                // confirmation, only y/n/Esc are live. y fires it via the
+                // executor; n or Esc cancels. Everything else is swallowed.
+                if let Some(pending) = state.pending_action.clone() {
+                    match key.code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            let result = match executor {
+                                Some(ref mut exec) => exec(pending),
+                                None => "actions are not enabled".to_string(),
+                            };
+                            state.last_action_result = Some(result);
+                            state.pending_action = None;
+                        }
+                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                            state.pending_action = None;
+                            state.last_action_result = Some("cancelled".to_string());
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 match key.code {
                     KeyCode::Char('q') => break,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
@@ -157,6 +194,41 @@ fn ui_loop(
                         state.pod_detail_metrics = !state.pod_detail_metrics;
                     }
                     KeyCode::Tab if state.view == View::Kube => state.toggle_kube_focus(),
+                    // Destructive-action triggers. Only live when an executor was
+                    // supplied (gate one: main provides it only if
+                    // admin.allow_actions is true). Each sets a pending action
+                    // that must then be y/N-confirmed (gate two).
+                    KeyCode::Char('d')
+                        if executor.is_some()
+                            && matches!(state.view, View::Kube | View::PodDetail) =>
+                    {
+                        if let Some((ns, pod)) = selected_pod_target(state, frame) {
+                            state.pending_action =
+                                Some(crate::view::PendingAction::DeletePod { namespace: ns, pod });
+                        }
+                    }
+                    KeyCode::Char('R')
+                        if executor.is_some()
+                            && matches!(state.view, View::Kube | View::PodDetail) =>
+                    {
+                        if let Some(report) = &frame.kube
+                            && let Some(selector) = report.selector.clone()
+                        {
+                            state.pending_action = Some(crate::view::PendingAction::RecycleAll {
+                                namespace: report.namespace.clone(),
+                                selector,
+                            });
+                        }
+                    }
+                    KeyCode::Char('D')
+                        if executor.is_some()
+                            && matches!(state.view, View::Kube | View::PodDetail) =>
+                    {
+                        if let Some(node) = selected_node_target(state, frame) {
+                            state.pending_action =
+                                Some(crate::view::PendingAction::CordonDrainNode { node });
+                        }
+                    }
                     KeyCode::Up | KeyCode::Char('k') => {
                         if state.view == View::PodDetail {
                             state.log_cursor_up();
@@ -250,12 +322,44 @@ fn draw(f: &mut ratatui::Frame, state: &ViewState, frame: &Frame) {
         View::Stability => " v=view  r=refresh  q=quit  (connection stability — flapping pods flagged)",
         _ => " ↑/↓=move  Enter=drill in  Esc=back  v=view  ?=legend  r=refresh  q=quit",
     };
-    f.render_widget(Paragraph::new(help), chunks[2]);
+    // The status line shows the last action's result if there is one, else the
+    // normal key help. (The pending-action prompt is a modal overlay, separate.)
+    let status_line: Paragraph = if let Some(result) = &state.last_action_result {
+        Paragraph::new(format!(" action: {result}")).style(Style::default().fg(Color::Cyan))
+    } else {
+        Paragraph::new(help)
+    };
+    f.render_widget(status_line, chunks[2]);
 
     // Help overlay draws on top of everything else.
     if state.show_help {
         draw_help_overlay(f);
     }
+    // Confirmation prompt draws on top of even the help overlay.
+    if let Some(pending) = &state.pending_action {
+        draw_confirm_overlay(f, &pending.prompt());
+    }
+}
+
+/// A centred modal asking the operator to confirm a destructive action. Drawn
+/// in alarm colours; y fires, n/Esc cancels.
+fn draw_confirm_overlay(f: &mut ratatui::Frame, prompt: &str) {
+    let area = f.area();
+    let w = (area.width as f32 * 0.6) as u16;
+    let h = 5u16;
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let rect = Rect { x, y, width: w, height: h };
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" confirm action ")
+        .border_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD));
+    let text = Paragraph::new(prompt)
+        .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD))
+        .block(block)
+        .wrap(ratatui::widgets::Wrap { trim: true });
+    f.render_widget(text, rect);
 }
 
 /// Render one metric as coloured spans. Value shown with a "/s" suffix for
@@ -466,6 +570,34 @@ fn draw_metrics(f: &mut ratatui::Frame, area: Rect, frame: &Frame, scroll: u16) 
     f.render_widget(Paragraph::new(lines).block(block).scroll((offset, 0)), area);
 }
 
+/// Resolve the (namespace, pod) target for a delete action: the pod under the
+/// cursor in the kube view, or the pod being viewed in pod-detail.
+fn selected_pod_target(state: &ViewState, frame: &Frame) -> Option<(String, String)> {
+    let report = frame.kube.as_ref()?;
+    let pod = match state.view {
+        View::PodDetail => state.selected_pod.clone()?,
+        View::Kube => report.pods.get(state.cursor).map(|p| p.name.clone())?,
+        _ => return None,
+    };
+    Some((report.namespace.clone(), pod))
+}
+
+/// Resolve the node target for a cordon+drain action: the node the selected pod
+/// runs on, so the operator acts on "the node this troubled consumer is on".
+fn selected_node_target(state: &ViewState, frame: &Frame) -> Option<String> {
+    let report = frame.kube.as_ref()?;
+    let pod_name = match state.view {
+        View::PodDetail => state.selected_pod.clone()?,
+        View::Kube => report.pods.get(state.cursor).map(|p| p.name.clone())?,
+        _ => return None,
+    };
+    report
+        .pods
+        .iter()
+        .find(|p| p.name == pod_name)
+        .and_then(|p| p.node.clone())
+}
+
 /// Shorten a pod name to its trailing hash for compact display (the deployment
 /// prefix is the same across all pods, so the tail is what distinguishes them).
 fn short_pod(pod: &str) -> &str {
@@ -635,6 +767,22 @@ fn draw_help_overlay(f: &mut ratatui::Frame) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from("CPU/MEM columns show used/limit, coloured by % of limit."));
+    // Admin actions (only usable when admin.allow_actions = true in config).
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Admin actions (require admin.allow_actions=true, then y/N confirm)",
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+    )));
+    for (key, meaning) in [
+        ("d", "delete the selected pod (controller recreates it)"),
+        ("R", "rolling-recycle ALL consumer pods, one at a time"),
+        ("D", "cordon + drain the selected pod's node"),
+    ] {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{key:<22}"), Style::default().fg(Color::Red)),
+            Span::raw(meaning),
+        ]));
+    }
     lines.push(Line::from(Span::styled(
         "press ? to close",
         Style::default().add_modifier(Modifier::ITALIC),

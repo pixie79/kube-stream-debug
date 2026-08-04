@@ -261,6 +261,11 @@ pub struct PodLogs {
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct KubeReport {
     pub namespace: String,
+    /// The label selector used to find the consumer pods, carried so a
+    /// destructive rolling-recycle can target the same set. None if discovery
+    /// found the pods another way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
     pub pods: Vec<PodSummary>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<KubeEvent>,
