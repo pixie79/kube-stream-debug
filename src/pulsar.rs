@@ -242,10 +242,16 @@ pub struct AdminClient {
 
 impl AdminClient {
     pub fn new(base_url: &str, token: &str, timeout: Duration) -> Self {
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(5))
-            .timeout(timeout)
-            .build();
+        // ureq 3: config lives on a Config built via Agent::config_builder().
+        // http_status_as_error(false) makes 4xx/5xx come back as Ok(response)
+        // so we can read the status and error body ourselves (ureq 3's
+        // Error::StatusCode carries only the code, not the response body).
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_connect(Some(Duration::from_secs(5)))
+            .timeout_global(Some(timeout))
+            .http_status_as_error(false)
+            .build()
+            .into();
         AdminClient {
             agent,
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -302,25 +308,38 @@ impl AdminClient {
     }
 
     fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T, PulsarError> {
-        let response = self
+        // ureq 3: .header() not .set(); with http_status_as_error(false) a 4xx/5xx
+        // is Ok(response), so we branch on the status ourselves. Bodies are read
+        // via .body_mut().read_json()/read_to_string().
+        let result = self
             .agent
             .get(url)
-            .set("Authorization", &format!("Bearer {}", self.token))
+            .header("Authorization", &format!("Bearer {}", self.token))
             .call();
 
-        match response {
-            Ok(resp) => Ok(resp.into_json::<T>()?),
-            Err(ureq::Error::Status(404, _)) => Err(PulsarError::NotFound),
-            Err(ureq::Error::Status(status, resp)) => {
-                let body = resp
-                    .into_string()
+        let mut resp = match result {
+            Ok(resp) => resp,
+            Err(ureq::Error::Io(e)) => return Err(PulsarError::Transport(e.to_string())),
+            Err(e) => return Err(PulsarError::Transport(e.to_string())),
+        };
+
+        let status = resp.status().as_u16();
+        match status {
+            200..=299 => resp
+                .body_mut()
+                .read_json::<T>()
+                .map_err(|e| PulsarError::Transport(format!("decode JSON: {e}"))),
+            404 => Err(PulsarError::NotFound),
+            _ => {
+                let body: String = resp
+                    .body_mut()
+                    .read_to_string()
                     .unwrap_or_default()
                     .chars()
                     .take(200)
                     .collect();
                 Err(PulsarError::Status { status, body })
             }
-            Err(ureq::Error::Transport(t)) => Err(PulsarError::Transport(t.to_string())),
         }
     }
 }
