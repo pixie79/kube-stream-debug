@@ -560,7 +560,7 @@ fn interesting_event(reason: &str) -> bool {
 /// Seconds since a `Time`, computed against the system clock. Negative clamped
 /// to 0 (clock skew).
 fn age_secs_from(t: &Time) -> i64 {
-    let then = t.0.timestamp();
+    let then = t.0.as_second();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -570,7 +570,7 @@ fn age_secs_from(t: &Time) -> i64 {
 
 /// Same for a `MicroTime` (event_time uses microsecond precision).
 fn age_secs_from_micro(t: &k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime) -> i64 {
-    let then = t.0.timestamp();
+    let then = t.0.as_second();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
