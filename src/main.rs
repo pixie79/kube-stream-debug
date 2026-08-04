@@ -742,8 +742,11 @@ fn process_metrics(
                 throttle_transition_rate: s.throttle_transition_rate,
                 active_parts_churn: s.active_parts_churn,
                 active_parts: s.active_parts,
+                idle_cull_rate: s.idle_cull_rate,
+                idle_cull_threshold_secs: s.idle_cull_threshold_secs,
                 flapping_rate: s.flapping_rate,
                 flapping_rebalance: s.flapping_rebalance,
+                idle_cull_loop: s.idle_cull_loop,
             }
         })
         .collect();

@@ -428,6 +428,30 @@ fn name_matches(actual: &str, configured: &str) -> bool {
     true
 }
 
+/// Aggregate a metric's value, but only over samples whose labels include a
+/// given key=value pair. Used to read a single `reason` out of a labeled
+/// counter (e.g. culls where reason="idle_timeout"), rather than summing all
+/// reasons together. Suffix-tolerant on the name; histogram components excluded.
+fn aggregate_value_where(samples: &[Sample], name: &str, label_key: &str, label_val: &str) -> Option<f64> {
+    let matching: Vec<f64> = samples
+        .iter()
+        .filter(|s| {
+            !s.name.ends_with("_bucket")
+                && !s.name.ends_with("_count")
+                && !s.name.ends_with("_sum")
+                && name_matches(&s.name, name)
+                && s.labels.iter().any(|(k, v)| k == label_key && v == label_val)
+        })
+        .map(|s| s.value)
+        .filter(|v| v.is_finite())
+        .collect();
+    if matching.is_empty() {
+        None
+    } else {
+        Some(matching.iter().sum())
+    }
+}
+
 /// Aggregate the current value of a metric across all its label series (e.g.
 /// per-topic lag summed). Matching tolerates exporter type/unit suffixes (see
 /// `name_matches`). Histogram component series (`_bucket`) are excluded so a
@@ -469,16 +493,25 @@ pub struct PodStability {
     pub active_parts_churn: f64,
     /// Current active partition count (for context).
     pub active_parts: f64,
+    /// Culls specifically attributed to idle_timeout, per scrape — the direct
+    /// signal that the idle-cull loop is active (vs culls for other reasons).
+    pub idle_cull_rate: f64,
+    /// The effective idle-cull threshold in seconds (from the pipeline), for
+    /// context — so you can see what value is actually driving the culling.
+    pub idle_cull_threshold_secs: f64,
     /// True when transition/reconnect rate is high enough to call it flapping.
     pub flapping_rate: bool,
     /// True when the active-partition count keeps changing (rebalance churn).
     pub flapping_rebalance: bool,
+    /// True when idle-timeout culls are actively occurring — the specific loop
+    /// you're hunting: idle→cull→rebalance.
+    pub idle_cull_loop: bool,
 }
 
 impl PodStability {
     /// Whether this pod shows any instability signal.
     pub fn unstable(&self) -> bool {
-        self.flapping_rate || self.flapping_rebalance
+        self.flapping_rate || self.flapping_rebalance || self.idle_cull_loop
     }
 }
 
@@ -487,12 +520,12 @@ impl PodStability {
 /// matched suffix-tolerantly like everything else.
 pub fn stability_series_names() -> &'static [&'static str] {
     &[
-        "ssync_source_consumers_culled", // the metric we're asking stream-sync to add
+        "ssync_source_consumers_culled_total",
+        "ssync_source_reconnects_total",
         "ssync_source_throttle_transitions_total",
-        "ssync_source_throttled_total",
         "ssync_partitions_active_subscribed",
         "ssync_source_partitions_active",
-        "ssync_destination_consecutive_failures",
+        "ssync_source_idle_cull_threshold_seconds",
     ]
 }
 
@@ -524,23 +557,47 @@ impl MetricHistory {
                 self.series.entry((*name).to_string()).or_default().push(v, window);
             }
         }
+        // Track the idle_timeout-reasoned cull and reconnect counts separately —
+        // summing all reasons would lose the cause (idle) vs effect (rebalance)
+        // distinction that makes this diagnostic. Stored under synthetic keys.
+        if let Some(v) = aggregate_value_where(
+            samples,
+            "ssync_source_consumers_culled_total",
+            "reason",
+            "idle_timeout",
+        ) {
+            self.series.entry("__cull_idle_timeout".to_string()).or_default().push(v, window);
+        }
+        if let Some(v) = aggregate_value_where(
+            samples,
+            "ssync_source_reconnects_total",
+            "reason",
+            "rebalance",
+        ) {
+            self.series.entry("__reconnect_rebalance".to_string()).or_default().push(v, window);
+        }
     }
 
     /// Compute the connection-stability verdict for this pod from the tracked
-    /// transition counters and the active-partition gauge.
+    /// cull/reconnect counters and the active-partition gauge.
     pub fn stability(&self, pod: &str) -> PodStability {
         let rate = |name: &str| self.series.get(name).and_then(|s| s.counter_rate()).unwrap_or(0.0);
         let gauge = |name: &str| self.series.get(name).and_then(|s| s.current()).unwrap_or(0.0);
         let variation = |name: &str| self.series.get(name).map(|s| s.total_variation()).unwrap_or(0.0);
 
-        // Reconnect/cull rate: prefer the (future) cull counter; else proxy from
-        // throttle transitions, which spike during the cull→rebalance loop.
-        let cull_rate = rate("ssync_source_consumers_culled");
+        // Idle-timeout culls specifically (the cause), tracked under a synthetic
+        // key in update(). This is the direct loop signal.
+        let idle_cull_rate = rate("__cull_idle_timeout");
+        // Total cull/reconnect rate across all reasons (fallback to throttle
+        // transitions if the counters aren't present).
+        let total_cull_rate = rate("ssync_source_consumers_culled_total");
         let throttle_transition_rate = rate("ssync_source_throttle_transitions_total");
-        let reconnect_rate = if cull_rate > 0.0 { cull_rate } else { throttle_transition_rate };
+        let reconnect_rate = if total_cull_rate > 0.0 {
+            total_cull_rate
+        } else {
+            throttle_transition_rate
+        };
 
-        // Active-partition churn: total variation of the active-subscribed gauge
-        // (falls back to source_partitions_active if the former is absent).
         let active_name = if self.series.contains_key("ssync_partitions_active_subscribed") {
             "ssync_partitions_active_subscribed"
         } else {
@@ -548,10 +605,13 @@ impl MetricHistory {
         };
         let active_parts_churn = variation(active_name);
         let active_parts = gauge(active_name);
+        let idle_cull_threshold_secs = gauge("ssync_source_idle_cull_threshold_seconds");
 
         let flapping_rate = reconnect_rate >= FLAP_RATE_THRESHOLD
             || throttle_transition_rate >= FLAP_RATE_THRESHOLD;
         let flapping_rebalance = active_parts_churn >= REBALANCE_CHURN_THRESHOLD;
+        // The specific loop: idle-timeout culls are actively happening.
+        let idle_cull_loop = idle_cull_rate >= 1.0;
 
         PodStability {
             pod: pod.to_string(),
@@ -559,8 +619,11 @@ impl MetricHistory {
             throttle_transition_rate,
             active_parts_churn,
             active_parts,
+            idle_cull_rate,
+            idle_cull_threshold_secs,
             flapping_rate,
             flapping_rebalance,
+            idle_cull_loop,
         }
     }
 
@@ -1005,43 +1068,66 @@ ssync_pipeline_unhealthy 0";
     fn stability_flags_flapping_pod() {
         let specs: Vec<MetricSpec> = vec![]; // stability tracks its own series
         let mut h = MetricHistory::default();
-        // Simulate the loop: throttle transitions climbing each scrape, active
-        // partitions oscillating (90 → 0 → 90 → 0 = huge churn).
+        // Simulate the loop: idle-timeout culls climbing, active partitions
+        // oscillating (90 → 0 → 90 → 0 = huge churn).
         let scrapes = [
             (100.0, 90.0),
             (105.0, 0.0),
             (110.0, 90.0),
             (115.0, 0.0),
         ];
-        for (transitions, active) in scrapes {
+        for (culls, active) in scrapes {
             let samples = vec![
-                Sample { name: "ssync_source_throttle_transitions_total".into(), labels: vec![], value: transitions },
+                Sample {
+                    name: "ssync_source_consumers_culled_total".into(),
+                    labels: vec![("reason".into(), "idle_timeout".into())],
+                    value: culls,
+                },
                 Sample { name: "ssync_partitions_active_subscribed".into(), labels: vec![], value: active },
             ];
             h.update(&samples, &specs, 5);
         }
         let s = h.stability("pod-flap");
-        assert!(s.flapping_rate, "climbing transition rate should flag flapping_rate");
+        assert!(s.idle_cull_loop, "climbing idle-timeout culls should flag the loop");
         assert!(s.flapping_rebalance, "oscillating active partitions should flag rebalance churn");
         assert!(s.unstable());
-        // Churn is the sum of |steps|: 90+90+90 = 270, well over threshold.
         assert!(s.active_parts_churn >= 4.0);
+        assert!(s.idle_cull_rate >= 1.0);
+    }
+
+    #[test]
+    fn stability_reads_idle_cull_reason_not_total() {
+        // Culls happen for multiple reasons; only idle_timeout should drive the
+        // loop flag. Here idle is flat (no loop) but memory_pressure climbs.
+        let specs: Vec<MetricSpec> = vec![];
+        let mut h = MetricHistory::default();
+        for mem in [10.0, 20.0, 30.0] {
+            let samples = vec![
+                Sample { name: "ssync_source_consumers_culled_total".into(), labels: vec![("reason".into(), "idle_timeout".into())], value: 5.0 }, // flat
+                Sample { name: "ssync_source_consumers_culled_total".into(), labels: vec![("reason".into(), "memory_pressure".into())], value: mem },
+                Sample { name: "ssync_partitions_active_subscribed".into(), labels: vec![], value: 90.0 },
+            ];
+            h.update(&samples, &specs, 5);
+        }
+        let s = h.stability("pod-mem");
+        assert!(!s.idle_cull_loop, "flat idle culls → no idle loop even though total culls rose");
+        assert_eq!(s.idle_cull_rate, 0.0, "idle-timeout culls were flat");
     }
 
     #[test]
     fn stability_clears_stable_pod() {
         let specs: Vec<MetricSpec> = vec![];
         let mut h = MetricHistory::default();
-        // Stable: no transitions, steady partition count.
+        // Stable: no culls, steady partition count.
         for _ in 0..4 {
             let samples = vec![
-                Sample { name: "ssync_source_throttle_transitions_total".into(), labels: vec![], value: 50.0 },
+                Sample { name: "ssync_source_consumers_culled_total".into(), labels: vec![("reason".into(), "idle_timeout".into())], value: 5.0 },
                 Sample { name: "ssync_partitions_active_subscribed".into(), labels: vec![], value: 90.0 },
             ];
             h.update(&samples, &specs, 5);
         }
         let s = h.stability("pod-stable");
-        assert!(!s.flapping_rate, "no transitions → not flapping");
+        assert!(!s.idle_cull_loop, "flat culls → no loop");
         assert!(!s.flapping_rebalance, "steady partitions → no rebalance churn");
         assert!(!s.unstable());
         assert_eq!(s.active_parts, 90.0);

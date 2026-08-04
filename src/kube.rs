@@ -224,8 +224,11 @@ pub struct PodStabilityLine {
     pub throttle_transition_rate: f64,
     pub active_parts_churn: f64,
     pub active_parts: f64,
+    pub idle_cull_rate: f64,
+    pub idle_cull_threshold_secs: f64,
     pub flapping_rate: bool,
     pub flapping_rebalance: bool,
+    pub idle_cull_loop: bool,
 }
 
 /// The curated metric summary for one pod.

@@ -494,8 +494,8 @@ fn draw_stability(f: &mut ratatui::Frame, area: Rect, frame: &Frame) {
 
     let header = Row::new(vec![
         Cell::from("POD"),
+        Cell::from("IDLE-CULL/s"),
         Cell::from("RECONNECT/s"),
-        Cell::from("THROTTLE-TRANS/s"),
         Cell::from("ACTIVE-PARTS"),
         Cell::from("CHURN"),
         Cell::from("VERDICT"),
@@ -503,29 +503,50 @@ fn draw_stability(f: &mut ratatui::Frame, area: Rect, frame: &Frame) {
     .style(Style::default().add_modifier(Modifier::BOLD));
 
     let mut rows: Vec<&crate::kube::PodStabilityLine> = report.pod_stability.iter().collect();
-    // Unstable pods first.
-    rows.sort_by_key(|s| if s.flapping_rate || s.flapping_rebalance { 0 } else { 1 });
+    // Unstable pods first; idle-cull loop is the worst.
+    rows.sort_by_key(|s| {
+        if s.idle_cull_loop {
+            0
+        } else if s.flapping_rate || s.flapping_rebalance {
+            1
+        } else {
+            2
+        }
+    });
+
+    // Threshold is a fleet-wide config value; show it once in the title if known.
+    let threshold = report
+        .pod_stability
+        .iter()
+        .map(|s| s.idle_cull_threshold_secs)
+        .find(|t| *t > 0.0);
 
     let table_rows: Vec<Row> = rows
         .iter()
         .map(|s| {
-            let unstable = s.flapping_rate || s.flapping_rebalance;
-            // Build the verdict text from the two independent signals.
-            let verdict = match (s.flapping_rate, s.flapping_rebalance) {
-                (true, true) => "FLAPPING (reconnect + rebalance)",
-                (true, false) => "FLAPPING (reconnect churn)",
-                (false, true) => "FLAPPING (rebalance churn)",
-                (false, false) => "stable",
+            let unstable = s.idle_cull_loop || s.flapping_rate || s.flapping_rebalance;
+            let verdict = if s.idle_cull_loop && s.flapping_rebalance {
+                "IDLE-CULL LOOP → rebalance churn"
+            } else if s.idle_cull_loop {
+                "IDLE-CULL LOOP"
+            } else if s.flapping_rebalance {
+                "rebalance churn"
+            } else if s.flapping_rate {
+                "reconnect churn"
+            } else {
+                "stable"
             };
-            let row_style = if unstable {
+            let row_style = if s.idle_cull_loop {
+                Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD)
+            } else if unstable {
                 Style::default().fg(Color::Yellow)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
             Row::new(vec![
                 Cell::from(short_pod(&s.pod).to_string()),
+                Cell::from(format!("{:.1}", s.idle_cull_rate)),
                 Cell::from(format!("{:.1}", s.reconnect_rate)),
-                Cell::from(format!("{:.1}", s.throttle_transition_rate)),
                 Cell::from(format!("{:.0}", s.active_parts)),
                 Cell::from(format!("{:.0}", s.active_parts_churn)),
                 Cell::from(verdict),
@@ -536,12 +557,17 @@ fn draw_stability(f: &mut ratatui::Frame, area: Rect, frame: &Frame) {
 
     let widths = [
         Constraint::Length(16),
-        Constraint::Length(13),
-        Constraint::Length(18),
+        Constraint::Length(12),
+        Constraint::Length(12),
         Constraint::Length(13),
         Constraint::Length(8),
-        Constraint::Min(20),
+        Constraint::Min(24),
     ];
+    let title = match threshold {
+        Some(t) => format!("connection stability  (idle-cull threshold: {t:.0}s)"),
+        None => "connection stability".to_string(),
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
     let table = Table::new(table_rows, widths).header(header).block(block);
     f.render_widget(table, area);
 }
