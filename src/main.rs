@@ -42,8 +42,12 @@ enum Format {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "pulsar-topic-health", version, about)]
+#[command(name = "pulsar-topic-health", version, about, disable_version_flag = true)]
 struct Cli {
+    /// Print version.
+    #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
+    version: Option<bool>,
+
     /// Path to the TOML config file.
     #[arg(short, long, default_value = "topics.toml")]
     config: PathBuf,
