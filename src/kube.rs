@@ -1025,6 +1025,8 @@ pub fn correlation_hint(report: &KubeReport, topic_unhealthy: bool) -> Option<St
 
 #[cfg(feature = "kube")]
 pub mod client;
+#[cfg(feature = "kube")]
+pub mod actions;
 
 #[cfg(test)]
 mod tests {

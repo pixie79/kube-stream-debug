@@ -74,6 +74,11 @@ pub struct Config {
     #[serde(default)]
     pub settings: Settings,
 
+    /// Optional destructive-action settings. Off by default — actions are gated
+    /// behind `admin.allow_actions = true` AND an interactive confirmation.
+    #[serde(default)]
+    pub admin: AdminConfig,
+
     /// Optional pod-metrics scraping (port-forward to each pod's /metrics and
     /// /health, summarise trends, capture raw for tuning). Off unless enabled.
     #[serde(default)]
@@ -215,6 +220,21 @@ pub struct Settings {
 pub enum OutputFormat {
     Table,
     Jsonl,
+}
+
+/// Destructive-action settings. The whole feature is off unless
+/// `allow_actions = true`; even then, every action additionally requires an
+/// interactive confirmation at the moment it's triggered. This is the first of
+/// the two gates (config + live confirm). There is deliberately no way to
+/// pre-authorise a specific action in config — the live confirmation is
+/// mandatory and cannot be disabled.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminConfig {
+    /// Master switch. When false (the default), no destructive action can be
+    /// invoked at all — the keys are inert and the tool stays read-only.
+    #[serde(default)]
+    pub allow_actions: bool,
 }
 
 /// Kubernetes correlation settings from the config file. Every field is
